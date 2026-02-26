@@ -1,0 +1,84 @@
+services:
+  ollama:
+    image: mirror.gcr.io/ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    volumes:
+      - open_webui_data:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      - ollama
+
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:latest
+    container_name: forgejo
+    restart: unless-stopped
+    ports:
+      - "3001:3000"   # web ui
+      - "2222:22"     # ssh git
+    volumes:
+      - forgejo_data:/data
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - FORGEJO__database__DB_TYPE=postgres
+      - FORGEJO__database__HOST=forgejo-db:5432
+      - FORGEJO__database__NAME=forgejo
+      - FORGEJO__database__USER=forgejo
+      - FORGEJO__database__PASSWD=forgejo
+      - FORGEJO__actions__ENABLED=true        # enable Actions!
+    depends_on:
+      - forgejo-db
+
+  forgejo-db:
+    image: postgres:16-alpine
+    container_name: forgejo-db
+    restart: unless-stopped
+    volumes:
+      - forgejo_db_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=forgejo
+      - POSTGRES_USER=forgejo
+      - POSTGRES_PASSWORD=forgejo
+
+  forgejo-runner:
+    image: code.forgejo.org/forgejo/runner:latest
+    container_name: forgejo-runner
+    restart: unless-stopped
+    volumes:
+      - forgejo_runner_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - forgejo
+    # Runner needs manual registration first — see below
+
+volumes:
+  ollama_data:
+    driver: local
+  open_webui_data:
+    driver: local
+  forgejo_data:
+    driver: local
+  forgejo_db_data:
+    driver: local
+  forgejo_runner_data:
+    driver: local
