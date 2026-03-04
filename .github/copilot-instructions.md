@@ -2,66 +2,75 @@
 
 ## Overview
 
-This repository sets up a local [Forgejo](https://forgejo.org/) instance (self-hosted Git forge) with a CI/CD runner, backed by PostgreSQL, all orchestrated via Docker Compose.
+This repository sets up a local Forgejo instance (self-hosted Git forge) with an Actions-style CI runner, backed by PostgreSQL, orchestrated via Docker Compose. Primary entry points: `docker-compose.yml`, `bootstrap.sh`, and `docs/forgejo-integration-guide.md`.
 
-## Architecture
+## Build / Test / Lint commands
 
-Three services defined in `docker-compose.yml`:
+There are no language-specific build/test/lint toolchains in this repository — the project is an infrastructure configuration for running Forgejo locally. Useful commands for validating and exercising the system:
 
-| Service | Image | Role |
-|---|---|---|
-| `forgejo` | `codeberg.org/forgejo/forgejo:9` | Git forge web UI + API (HTTP :1234, SSH :2222) |
-| `forgejo-db` | `postgres:16-alpine` | PostgreSQL database for Forgejo |
-| `forgejo-runner` | `data.forgejo.org/forgejo/runner:6.2.2` | Actions CI runner |
+- First-time bootstrap (creates runner config):
+  - bash bootstrap.sh
+- Start services (after bootstrap):
+  - docker compose up -d
+- Stop services:
+  - docker compose down
+- Tail logs:
+  - docker compose logs -f forgejo
+  - docker compose logs -f forgejo-runner
+- Destroy including volumes:
+  - docker compose down -v
 
-The runner connects to Forgejo via the internal Docker network (`http://forgejo:3000`) — not the host-exposed port.
+Single-check / "single test":
+- Health endpoint quick check (equivalent to a single test):
+  - curl -f http://localhost:1234 || echo "Forgejo not ready"
+- Runner registration file check (inside volume):
+  - docker run --rm -v forgejo_runner_data:/data busybox test -f /data/.runner && echo "runner registered" || echo "runner missing"
 
-## Bootstrap Flow
+If adding an application or repo with its own tests, run those tests inside that repo's environment or within an ephemeral container; this repo itself contains no unit/integration tests.
 
-Run `bootstrap.sh` **once** on first setup. It:
-1. Starts `forgejo` and `forgejo-db` (waits 20s for DB readiness)
-2. Generates a runner registration secret with `openssl rand -hex 20`, saves it to `forgejo_secret.txt`
-3. Creates the runner registration file via `forgejo-runner create-runner-file`
-4. Starts the `forgejo-runner` service
+## High-level architecture
 
-**Do not re-run `bootstrap.sh`** on an existing instance — it will overwrite `forgejo_secret.txt` and the runner will lose its registration.
+- Services (see `docker-compose.yml`):
+  - forgejo: the web UI and API (container port 3000 mapped to host 1234)
+  - forgejo-db: Postgres backing store
+  - forgejo-runner: Actions-style runner that executes workflows
+- Networking: runner connects to Forgejo over the internal compose network at `http://forgejo:3000` (bootstrap.sh handles internal vs. host addressing for podman).
+- Volumes: persistent data stored in three named volumes — `forgejo_data`, `forgejo_db_data`, `forgejo_runner_data`.
+- Bootstrap flow: `bootstrap.sh` starts forgejo + db, waits for health, fetches a real runner registration token via the Forgejo API (using `FORGEJO_ADMIN_PASSWORD`), writes `forgejo_secret.txt`, registers the runner, and starts the runner service.
 
-## Key Commands
+Refer to `docs/forgejo-integration-guide.md` for detailed runbooks and API examples.
 
-```bash
-# First-time setup
-bash bootstrap.sh
+## Key conventions and repository-specific patterns
 
-# Start all services (after initial bootstrap)
-docker compose up -d
+- .env is required for `bootstrap.sh` and must contain at minimum:
+  - POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD, FORGEJO_ADMIN_PASSWORD
+  - Use `env.example` as the template; do not commit a real `.env` file.
+- bootstrap.sh behavior:
+  - Detects container runtime by calling `podman info` or `docker info` (daemon check).
+  - Uses `podman-compose` when podman is available, otherwise `docker compose`.
+  - Uses internal vs host URLs appropriately (`http://host.containers.internal:1234` for podman run contexts vs `http://forgejo:3000` on the compose network).
+  - Idempotent runner registration: skips registration if `/data/.runner` exists in the `forgejo_runner_data` volume.
+- Runner labels: add `--labels ubuntu-latest,linux/amd64` to the runner registration (in `bootstrap.sh`) if you need the runner to accept `runs-on: ubuntu-latest` workflows.
+- Forgejo workflow override: place Forgejo-native workflows under `.forgejo/workflows/` to override `.github/workflows/` on the Forgejo instance.
+- Secrets: `forgejo_secret.txt` is produced by `bootstrap.sh` and is intentionally local; do not treat it as a production secret.
 
-# Stop all services
-docker compose down
+## Files and docs to consult
 
-# View logs
-docker compose logs -f forgejo
-docker compose logs -f forgejo-runner
+- `docs/forgejo-integration-guide.md` — step-by-step integration and runbook (mirroring, runner labels, API examples).
+- `docs/forgejo-scrum-backlog.md` — backlog and operational tasks useful for agents or automation.
+- `docker-compose.yml` and `bootstrap.sh` — primary implementation files to modify for runtime behavior.
+- `env.example` — template for `.env` variables.
 
-# Destroy everything including volumes
-docker compose down -v
-```
+## AI assistant / other assistant configs checked
 
-## Runner: Podman Socket
+No CLAUDE.md, .cursorrules, AGENTS.md, .windsurfrules, CONVENTIONS.md, AIDER_CONVENTIONS.md, .clinerules, or similar AI assistant config files were found; important repo-specific behavior is captured above and in `docs/`.
 
-The runner mounts `/run/user/1000/podman/podman.sock` as `/var/run/docker.sock`. This assumes:
-- The host user has UID 1000
-- Podman is running in rootless mode for that user (`systemctl --user start podman.socket`)
+## Quick troubleshooting checks
 
-If the socket path is different (e.g., different UID or Docker instead of Podman), update the volume mount in `docker-compose.yml`.
+- Is `.env` present and populated? `grep -q "FORGEJO_ADMIN_PASSWORD" .env || echo ".env missing key"`
+- Is Forgejo healthy? `curl -f http://localhost:1234 || echo "not healthy"`
+- Is the runner registered? `docker run --rm -v forgejo_runner_data:/data busybox test -f /data/.runner && echo OK`
 
-## Forgejo Configuration
+---
 
-Forgejo settings are passed as environment variables using the `FORGEJO__<section>__<key>` pattern. For example:
-- `FORGEJO__database__DB_TYPE=postgres`
-- `FORGEJO__actions__ENABLED=true`
-
-Add new settings to the `forgejo` service's `environment` block following this naming convention.
-
-## Secrets
-
-`forgejo_secret.txt` is generated by `bootstrap.sh` and used for runner registration. It is committed intentionally as a local-only secret for this development setup — do not use this pattern for production deployments.
+(If edits are needed to add explicit language-specific build/test commands for an application you mirror here, add them to this file under "Build / Test / Lint commands".)
