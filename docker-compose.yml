@@ -1,53 +1,32 @@
 services:
-  ollama:
-    image: mirror.gcr.io/ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: open-webui
-    restart: unless-stopped
-    ports:
-      - "3000:8080"
-    volumes:
-      - open_webui_data:/app/backend/data
-    environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
-    depends_on:
-      - ollama
-
   forgejo:
-    image: codeberg.org/forgejo/forgejo:latest
+    image: codeberg.org/forgejo/forgejo:9
     container_name: forgejo
     restart: unless-stopped
     ports:
-      - "3001:3000"   # web ui
-      - "2222:22"     # ssh git
+      - "1234:3000"
+      - "2222:22"
     volumes:
       - forgejo_data:/data
+      - /etc/localtime:/etc/localtime:ro
     environment:
       - USER_UID=1000
       - USER_GID=1000
       - FORGEJO__database__DB_TYPE=postgres
       - FORGEJO__database__HOST=forgejo-db:5432
-      - FORGEJO__database__NAME=forgejo
-      - FORGEJO__database__USER=forgejo
-      - FORGEJO__database__PASSWD=forgejo
-      - FORGEJO__actions__ENABLED=true        # enable Actions!
+      - FORGEJO__database__NAME=${POSTGRES_DB:-forgejo}
+      - FORGEJO__database__USER=${POSTGRES_USER:-forgejo}
+      - FORGEJO__database__PASSWD=${POSTGRES_PASSWORD}
+      - FORGEJO__actions__ENABLED=true
     depends_on:
-      - forgejo-db
+      forgejo-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   forgejo-db:
     image: postgres:16-alpine
@@ -56,29 +35,29 @@ services:
     volumes:
       - forgejo_db_data:/var/lib/postgresql/data
     environment:
-      - POSTGRES_DB=forgejo
-      - POSTGRES_USER=forgejo
-      - POSTGRES_PASSWORD=forgejo
+      - POSTGRES_DB=${POSTGRES_DB:-forgejo}
+      - POSTGRES_USER=${POSTGRES_USER:-forgejo}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-forgejo} -d ${POSTGRES_DB:-forgejo}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   forgejo-runner:
-    image: code.forgejo.org/forgejo/runner:latest
+    image: data.forgejo.org/forgejo/runner:6.2.2
     container_name: forgejo-runner
     restart: unless-stopped
+    user: 0:0
     volumes:
       - forgejo_runner_data:/data
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/user/1000/podman/podman.sock:/var/run/docker.sock
     depends_on:
-      - forgejo
-    # Runner needs manual registration first — see below
+      forgejo:
+        condition: service_healthy
 
 volumes:
-  ollama_data:
-    driver: local
-  open_webui_data:
-    driver: local
   forgejo_data:
-    driver: local
   forgejo_db_data:
-    driver: local
   forgejo_runner_data:
-    driver: local
