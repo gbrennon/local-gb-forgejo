@@ -50,6 +50,7 @@ services:
     container_name: forgejo-runner
     restart: unless-stopped
     user: 0:0
+    command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     volumes:
       - forgejo_runner_data:/data
       - /run/user/1000/podman/podman.sock:/var/run/docker.sock

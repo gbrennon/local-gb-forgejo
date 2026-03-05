@@ -399,3 +399,114 @@ All endpoints are relative to `http://localhost:1234/api/v1`. Auth: `-u "admin:$
 | List workflows | GET | `/repos/{owner}/{repo}/actions/workflows` |
 
 Interactive API docs: `http://localhost:1234/api/swagger`
+
+---
+
+## 6. Exposing Forgejo to the Internet
+
+To redirect GitHub Actions to your local Forgejo, GitHub must be able to reach your Forgejo instance. This requires a public URL.
+
+### Option: Cloudflare Tunnel (Free, Recommended)
+
+Cloudflare Tunnel provides a free, permanent public URL that tunnels traffic to your local Forgejo. No port forwarding, no firewall config, no cost.
+
+#### Cost
+- **Free** — Cloudflare Tunnel is free for personal/development use with no monthly fees.
+
+#### Prerequisites
+- A Cloudflare account (free)
+- `cloudflared` installed on your host machine
+
+#### Step 1: Install cloudflared
+
+**macOS (Homebrew):**
+```bash
+brew install cloudflared
+```
+
+**Linux:**
+```bash
+sudo curl -L -o /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+sudo chmod +x /usr/local/bin/cloudflared
+```
+
+**Windows:**
+Download from https://github.com/cloudflare/cloudflared/releases
+
+#### Step 2: Authenticate with Cloudflare
+
+```bash
+cloudflared tunnel login
+```
+
+This opens a browser window. Log in with your Cloudflare account and authorize the tunnel. This creates a `~/.cloudflared/cert.pem`.
+
+#### Step 3: Create a tunnel
+
+```bash
+cloudflared tunnel create forgejo-local
+```
+
+Replace `forgejo-local` with your preferred name. This outputs a tunnel UUID like `a1b2c3d4-...`. Note the UUID.
+
+#### Step 4: Configure DNS and tunnel
+
+```bash
+cloudflared tunnel route dns forgejo-local forgejo.yourdomain.example
+```
+
+Replace `forgejo.yourdomain.example` with your desired subdomain. This creates a CNAME record in Cloudflare pointing to your tunnel.
+
+#### Step 5: Run the tunnel
+
+```bash
+cloudflared tunnel --url http://localhost:1234 run <TUNNEL_UUID>
+```
+
+Replace `<TUNNEL_UUID>` with the UUID from Step 3. Your Forgejo is now accessible at `https://forgejo.yourdomain.example`.
+
+#### Step 6: Run tunnel as a service (optional, for persistence)
+
+**Linux (systemd):**
+```bash
+sudo cloudflared tunnel --config ~/.cloudflared/config.yml service install
+```
+
+Create `~/.cloudflared/config.yml`:
+```yaml
+tunnel: <TUNNEL_UUID>
+credentials-file: /home/$USER/.cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: forgejo.yourdomain.example
+    service: http://localhost:1234
+  - service: http_status:404
+```
+
+**macOS (launchd):**
+```bash
+cloudflared tunnel service install
+```
+
+#### Verification
+
+Once the tunnel is running:
+```bash
+curl -sf https://forgejo.yourdomain.example || echo "Tunnel not ready"
+```
+
+Your public Forgejo URL is now ready. Use this URL when:
+- Configuring webhooks from GitHub/GitLab
+- Setting up repository mirrors
+- Registering runners that need external access
+
+### Alternative: ngrok (Simpler but URL changes)
+
+If you want a quicker setup without Cloudflare account:
+```bash
+ngrok http 1234
+```
+
+**Cost:** Free tier has URL changes on restart. Paid plans start at $10/month for permanent URLs.
+
+**Trade-off:** ngrok is easier to set up but the URL changes each time you restart it. Cloudflare Tunnel gives you a permanent subdomain as long as the tunnel runs.

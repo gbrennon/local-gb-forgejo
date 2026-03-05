@@ -2,8 +2,9 @@
 set -euo pipefail
 
 SECRET_FILE="forgejo_secret.txt"
-RUNNER_CONFIG="/data/.runner"
+RUNNER_CONFIG="/data/config.yml"
 FORGEJO_HOST_PORT="1234"
+FORGEJO_ADMIN_USER="${FORGEJO_ADMIN_USER:-forgejo_admin}"
 
 # ---------------------------------------------------------------------------
 # Load .env file
@@ -70,30 +71,28 @@ echo "Forgejo is ready."
 # ---------------------------------------------------------------------------
 # Idempotent: skip registration if runner config already exists in the volume
 # ---------------------------------------------------------------------------
-if $CONTAINER_RUNTIME run --rm \
-    -v forgejo_runner_data:/data \
-    busybox test -f "$RUNNER_CONFIG" 2>/dev/null; then
+if $COMPOSE run --rm forgejo-runner sh -c "test -f $RUNNER_CONFIG" 2>/dev/null; then
   echo "Runner already registered, skipping."
 else
   # ---------------------------------------------------------------------------
   # Ensure the Forgejo admin user exists (no-op if already created)
   # ---------------------------------------------------------------------------
   echo "Ensuring Forgejo admin user exists..."
-  $CONTAINER_RUNTIME exec forgejo \
+  $CONTAINER_RUNTIME exec --user git forgejo \
     forgejo admin user create \
-    --username admin \
+    --username "${FORGEJO_ADMIN_USER}" \
     --password "${FORGEJO_ADMIN_PASSWORD}" \
-    --email admin@local.dev \
+    --email "${FORGEJO_ADMIN_USER}@local.dev" \
     --admin \
-    2>&1 | grep -v "already exists" || true
+    --must-change-password=false \
+    2>&1 | grep -v -E "already exists|name is reserved" || true
 
   # ---------------------------------------------------------------------------
   # Fetch a runner registration token from the Forgejo API
   # ---------------------------------------------------------------------------
   echo "Fetching runner registration token from Forgejo API..."
   forgejo_secret=$(curl -sf \
-    -X POST \
-    -u "admin:${FORGEJO_ADMIN_PASSWORD}" \
+    -u "${FORGEJO_ADMIN_USER}:${FORGEJO_ADMIN_PASSWORD}" \
     "${FORGEJO_HOST_URL}/api/v1/admin/runners/registration-token" \
     | grep -o '"token":"[^"]*"' \
     | cut -d'"' -f4)
@@ -106,12 +105,16 @@ else
   echo "$forgejo_secret" > "$SECRET_FILE"
   echo "Token saved to $SECRET_FILE"
 
+  # Generate a default config file, then register with labels
   $COMPOSE run --rm forgejo-runner \
-    forgejo-runner create-runner-file \
-    --connect \
-    --instance "$FORGEJO_INTERNAL_URL" \
-    --name local-runner \
-    --secret "$forgejo_secret"
+    sh -c "forgejo-runner generate-config > /data/config.yml && \
+      forgejo-runner register \
+        -c /data/config.yml \
+        --no-interactive \
+        --instance '$FORGEJO_INTERNAL_URL' \
+        --name local-runner \
+        --token '$forgejo_secret' \
+        --labels ubuntu-latest,linux/amd64"
 fi
 
 compose_up forgejo-runner
