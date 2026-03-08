@@ -24,10 +24,6 @@ Required variables in .env (relative to this script):
   GITHUB_PAT              GitHub Personal Access Token with 'repo' scope
                           Create one at: https://github.com/settings/tokens/new
 
-Optional variables in .env:
-  FORGEJO_WEBHOOK_TOKEN   Forgejo API token for webhook auth (see Step 7 of
-                          docs/delegate-github-actions-to-forgejo.md)
-
 Example:
   $(basename "$0") myorg myrepo
   $(basename "$0") octocat Hello-World
@@ -116,7 +112,7 @@ response=$(curl -s -X POST \
     \"clone_addr\": \"https://github.com/${ORG}/${REPO}.git\",
     \"auth_token\": \"${GITHUB_PAT}\",
     \"mirror\": true,
-    \"mirror_interval\": \"8h\",
+    \"mirror_interval\": \"1m\",
     \"repo_name\": \"${REPO}\",
     \"repo_owner\": \"${FORGEJO_ADMIN_USER}\",
     \"service\": \"github\",
@@ -227,5 +223,4 @@ info ""
 info "To trigger a sync at any time:"
 info "  curl -s -X POST -u '${AUTH}' ${FORGEJO_HOST}/api/v1/repos/${FORGEJO_ADMIN_USER}/${REPO}/mirror-sync"
 info ""
-info "For webhook setup (instant sync on GitHub push), see:"
-info "  docs/delegate-github-actions-to-forgejo.md — Step 7"
+info "Mirror interval is set to 1 minute — Forgejo will auto-sync every 60 seconds."

@@ -1,0 +1,6 @@
+on: [push]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest   # matches label registered in bootstrap.sh
+    steps:
+      - run: echo "Runner is working"

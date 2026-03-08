@@ -1,0 +1,10 @@
+version: 3
+
+agent:
+  authtoken: ${NGROK_AUTHTOKEN}
+
+endpoints:
+  - name: forgejo
+    url: https://${NGROK_DOMAIN}
+    upstream:
+      url: http://forgejo:3000

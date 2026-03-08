@@ -1,11 +1,10 @@
 services:
   forgejo:
-    image: codeberg.org/forgejo/forgejo:9
+    image: codeberg.org/forgejo/forgejo:11
     container_name: forgejo
     restart: unless-stopped
     ports:
       - "1234:3000"
-      - "2222:22"
     volumes:
       - forgejo_data:/data
       - /etc/localtime:/etc/localtime:ro
@@ -18,6 +17,7 @@ services:
       - FORGEJO__database__USER=${POSTGRES_USER:-forgejo}
       - FORGEJO__database__PASSWD=${POSTGRES_PASSWORD}
       - FORGEJO__actions__ENABLED=true
+      - FORGEJO__actions__RUNNER_MODE=docker
     depends_on:
       forgejo-db:
         condition: service_healthy
@@ -46,14 +46,17 @@ services:
       start_period: 10s
 
   forgejo-runner:
-    image: data.forgejo.org/forgejo/runner:6.2.2
+    image: data.forgejo.org/forgejo/runner:9
     container_name: forgejo-runner
     restart: unless-stopped
     user: 0:0
+    working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     volumes:
       - forgejo_runner_data:/data
-      - /run/user/1000/podman/podman.sock:/var/run/docker.sock
+      - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
+    security_opt:
+      - label=disable
     depends_on:
       forgejo:
         condition: service_healthy
