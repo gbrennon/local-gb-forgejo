@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Forgejo API client functions.
-# Requires: AUTH, FORGEJO_HOST, FORGEJO_ADMIN_USER, GITHUB_PAT (source common.sh first).
 
 # shellcheck source=common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -13,8 +12,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 forgejo_list_mirrors() {
   local page=1
   while true; do
-    local chunk
-    chunk=$(curl -sf \
+    local page_output
+    page_output=$(curl -sf \
       -u "${AUTH}" \
       "${FORGEJO_HOST}/api/v1/repos/search?limit=50&page=${page}" \
       | python3 -c "
@@ -27,8 +26,8 @@ for r in repos:
 print('__END__' if len(repos) < 50 else '__MORE__')
 " 2>/dev/null || true)
 
-    echo "$chunk" | grep -v '__END__\|__MORE__' || true
-    echo "$chunk" | grep -q '__END__' && break
+    echo "$page_output" | grep -v '__END__\|__MORE__' || true
+    echo "$page_output" | grep -q '__END__' && break
     page=$((page + 1))
   done
 }
@@ -63,13 +62,13 @@ forgejo_create_mirror() {
       \"private\": false
     }")
 
-  local full_name error_msg
+  local full_name api_error_msg
   full_name=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('full_name',''))" 2>/dev/null || true)
-  error_msg=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',''))" 2>/dev/null || true)
+  api_error_msg=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',''))" 2>/dev/null || true)
 
   if [[ -n "$full_name" ]]; then
     echo "$full_name"
-  elif echo "$error_msg" | grep -qi "already exist"; then
+  elif echo "$api_error_msg" | grep -qi "already exist"; then
     echo "exists"
   else
     die "Failed to create mirror for ${org}/${repo}. Response: ${response}"
@@ -164,12 +163,12 @@ print(m.group(1) if m else '')
 }
 
 # ---------------------------------------------------------------------------
-# forgejo_scan_secrets <owner/repo>
+# forgejo_report_missing_secrets <owner/repo>
 # Clones the mirror locally, scans .github/workflows/ for secrets.* references,
 # and prints the curl commands needed to register each missing secret.
 # Admin credentials are used so all repos are accessible regardless of owner.
 # ---------------------------------------------------------------------------
-forgejo_scan_secrets() {
+forgejo_report_missing_secrets() {
   local owner_repo="$1"
   local repo="${owner_repo#*/}"
 
@@ -187,23 +186,20 @@ forgejo_scan_secrets() {
     return
   fi
 
-  local required_secrets
-  required_secrets=$(grep -r 'secrets\.' "${tmp_clone}/${repo}/.github/workflows/" \
+  local referenced_secrets
+  referenced_secrets=$(grep -r 'secrets\.' "${tmp_clone}/${repo}/.github/workflows/" \
     | grep -o 'secrets\.[A-Za-z_][A-Za-z0-9_]*' \
     | sort -u || true)
 
-  if [[ -n "$required_secrets" ]]; then
+  if [[ -n "$referenced_secrets" ]]; then
     warn "Secrets referenced in workflow files — register them in Forgejo:"
     while IFS= read -r s; do
       local secret_name="${s#secrets.}"
       info "  curl -s -X PUT -u '${AUTH}' -H 'Content-Type: application/json' \\"
       info "    '${FORGEJO_HOST}/api/v1/repos/${owner_repo}/actions/secrets/${secret_name}' \\"
       info "    -d '{\"data\": \"YOUR_VALUE\"}'"
-    done <<< "$required_secrets"
+    done <<< "$referenced_secrets"
   else
     ok "No secrets.* references found in workflow files"
   fi
 }
-
-
-# end of forgejo-api.sh
