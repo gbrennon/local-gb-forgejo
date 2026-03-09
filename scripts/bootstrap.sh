@@ -16,27 +16,10 @@ COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(basename "$PWD")}"
 RUNNER_VOLUME="${COMPOSE_PROJECT_NAME}_forgejo_runner_data"
 
 # ---------------------------------------------------------------------------
-# Logging helpers
+# Shared common utilities
 # ---------------------------------------------------------------------------
-log_ok() {
-  echo "[OK] $1"
-}
-
-log_fail() {
-  echo "[FAIL] $1" >&2
-}
-
-log_error() {
-  echo "ERROR: $1" >&2
-}
-
-log_warn() {
-  echo "[WARN] $1" >&2
-}
-
-log_info() {
-  echo "[INFO] $1"
-}
+# shellcheck disable=SC1090
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)/common.sh"
 
 # ---------------------------------------------------------------------------
 # load_env
@@ -49,7 +32,7 @@ load_env() {
     source "$env_file"
     set +a
   else
-    log_error ".env file not found. Copy .env.example to .env and fill in values."
+    die ".env file not found. Copy .env.example to .env and fill in values."
     exit 1
   fi
 }
@@ -65,7 +48,7 @@ ensure_podman_socket() {
   local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
   [[ -S "$sock" ]] && return 0  # socket already present — nothing to do
 
-  log_info "podman socket missing at $sock — restarting podman.socket ..."
+  info "podman socket missing at $sock — restarting podman.socket ..."
   if systemctl --user restart podman.socket 2>/dev/null; then
     local retries=10
     local i=0
@@ -73,13 +56,13 @@ ensure_podman_socket() {
       sleep 1
       i=$((i + 1))
       if [[ $i -ge $retries ]]; then
-        log_warn "podman socket did not appear after restart — will fall back to docker if available."
+        die "podman socket did not appear after restart — will fall back to docker if available."
         return 0
       fi
     done
-    log_info "podman socket ready."
+    info "podman socket ready."
   else
-    log_warn "systemctl --user restart podman.socket failed — will fall back to docker if available."
+    warn "systemctl --user restart podman.socket failed — will fall back to docker if available."
   fi
 }
 
@@ -98,11 +81,10 @@ detect_runtime() {
     COMPOSE="docker compose"
     CONTAINER_RUNTIME="docker"
   else
-    log_error "neither podman nor docker daemon is reachable."
-    exit 1
+    die "neither podman nor docker daemon is reachable."
   fi
-  log_info "Detected container runtime: $CONTAINER_RUNTIME"
-  log_info "Compose project: $COMPOSE_PROJECT_NAME  →  runner volume: $RUNNER_VOLUME"
+  info "Detected container runtime: $CONTAINER_RUNTIME"
+  info "Compose project: $COMPOSE_PROJECT_NAME  →  runner volume: $RUNNER_VOLUME"
 
   # For runner registration: podman-compose run is outside the pod network,
   # so we reach Forgejo via the host. Docker shares the compose network.
@@ -129,7 +111,7 @@ kill_port() {
     $CONTAINER_RUNTIME ps --format "{{.Names}} {{.Ports}}"       | awk -v p=":${port}->" '$0 ~ p {print $1}'       | head -1
   )
   if [[ -n "$container" ]]; then
-    log_info "Removing container ${container} holding port ${port}..."
+    info "Removing container ${container} holding port ${port}..."
     $CONTAINER_RUNTIME rm -f "$container" 2>/dev/null || true
   fi
 }
@@ -159,28 +141,28 @@ start_core_services() {
 # wait_for_forgejo
 # ---------------------------------------------------------------------------
 wait_for_forgejo() {
-  log_info "Waiting for Forgejo container to be healthy..."
+  info "Waiting for Forgejo container to be healthy..."
   until $CONTAINER_RUNTIME inspect --format='{{.State.Health.Status}}' forgejo 2>/dev/null | grep -q "healthy"; do
     sleep 3
-    log_info "still waiting..."
+    info "still waiting..."
   done
 
   # Container is healthy but app.ini may not be written yet (INSTALL_LOCK boots
   # it automatically). Gate on the API actually responding before using the CLI.
-  log_info "Waiting for Forgejo API to be ready..."
+  info "Waiting for Forgejo API to be ready..."
   local retries=20
   local i=0
   until curl -sf "${FORGEJO_HOST_URL}/api/v1/version" >/dev/null 2>&1; do
     sleep 3
     i=$((i + 1))
     if [[ $i -ge $retries ]]; then
-      log_error "Forgejo API did not become ready — check: $CONTAINER_RUNTIME logs forgejo"
+      die "Forgejo API did not become ready — check: $CONTAINER_RUNTIME logs forgejo"
       exit 1
     fi
-    log_info "API not ready yet... (${i}/${retries})"
+    info "API not ready yet... (${i}/${retries})"
   done
 
-  log_info "Forgejo is ready."
+  info "Forgejo is ready."
 }
 
 # ---------------------------------------------------------------------------
@@ -204,7 +186,7 @@ runner_is_registered() {
 # Exits the script on any unexpected failure.
 # ---------------------------------------------------------------------------
 ensure_admin_user() {
-  log_info "Ensuring Forgejo admin user exists..."
+  info "Ensuring Forgejo admin user exists..."
   local output exit_code=0
   output=$($CONTAINER_RUNTIME exec --user git forgejo \
     forgejo admin user create \
@@ -215,16 +197,16 @@ ensure_admin_user() {
       --must-change-password=false 2>&1) || exit_code=$?
 
   if echo "$output" | grep -qE "already exists|name is reserved"; then
-    log_info "Admin user '${FORGEJO_ADMIN_USER}' already exists."
+    info "Admin user '${FORGEJO_ADMIN_USER}' already exists."
     return 1
   fi
 
   if [[ $exit_code -ne 0 ]]; then
-    log_error "Admin user creation failed (exit ${exit_code}): ${output}"
+    die "Admin user creation failed (exit ${exit_code}): ${output}"
     exit 1
   fi
 
-  [[ -n "$output" ]] && log_info "$output"
+  [[ -n "$output" ]] && info "$output"
   return 0
 }
 
@@ -233,7 +215,7 @@ ensure_admin_user() {
 # Prints the token to stdout; all other output goes to stderr.
 # ---------------------------------------------------------------------------
 fetch_registration_token() {
-  log_info "Fetching runner registration token from Forgejo API..." >&2
+  info "Fetching runner registration token from Forgejo API..."
   local tmpfile
   tmpfile=$(mktemp)
   local http_code
@@ -247,9 +229,9 @@ fetch_registration_token() {
   rm -f "$tmpfile"
 
   if [[ "$http_code" != "200" ]]; then
-    log_error "Token endpoint returned HTTP ${http_code} (expected 200)." >&2
-    log_error "Response body: ${response}" >&2
-    log_error "Hint: ensure admin user '${FORGEJO_ADMIN_USER}' exists and password is correct." >&2
+    die "Token endpoint returned HTTP ${http_code} (expected 200)."
+    die "Response body: ${response}"
+    die "Hint: ensure admin user '${FORGEJO_ADMIN_USER}' exists and password is correct."
     exit 1
   fi
 
@@ -257,7 +239,7 @@ fetch_registration_token() {
   token=$(echo "$response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
   if [[ -z "$token" ]]; then
-    log_error "Could not extract token from API response: ${response}" >&2
+    die "Could not extract token from API response: ${response}"
     exit 1
   fi
 
@@ -274,7 +256,7 @@ register_runner() {
   local token="$1"
 
   echo "$token" > "$SECRET_FILE"
-  log_info "Token saved to $SECRET_FILE"
+  info "Token saved to $SECRET_FILE"
 
   $COMPOSE run --rm -w /data forgejo-runner \
     sh -c "forgejo-runner generate-config > /data/config.yml && \
@@ -299,12 +281,12 @@ bootstrap_runner() {
   ensure_admin_user && forgejo_is_fresh=true || true
 
   if ! $forgejo_is_fresh && runner_is_registered; then
-    log_info "Runner already registered, skipping."
+    info "Runner already registered, skipping."
     return
   fi
 
   if $forgejo_is_fresh && runner_is_registered; then
-    log_info "Forgejo data reset detected — clearing stale runner credentials..."
+    info "Forgejo data reset detected — clearing stale runner credentials..."
     $CONTAINER_RUNTIME run --rm \
       -v "${RUNNER_VOLUME}:/data" \
       busybox \
@@ -328,20 +310,20 @@ start_runner() {
 # Polls until the runner logs show it has declared itself to Forgejo.
 # ---------------------------------------------------------------------------
 wait_for_runner() {
-  log_info "Waiting for runner to connect to Forgejo..."
+  info "Waiting for runner to connect to Forgejo..."
   local retries=20
   local i=0
   until $CONTAINER_RUNTIME logs forgejo-runner 2>&1 | grep -q "declared successfully"; do
     sleep 3
     i=$((i + 1))
     if [[ $i -ge $retries ]]; then
-      log_error "runner did not connect within expected time."
-      log_error "Check logs: $CONTAINER_RUNTIME logs forgejo-runner"
+      die "runner did not connect within expected time."
+      die "Check logs: $CONTAINER_RUNTIME logs forgejo-runner"
       exit 1
     fi
-    log_info "still waiting for runner... (${i}/${retries})"
+    info "still waiting for runner... (${i}/${retries})"
   done
-  log_info "Runner connected."
+  info "Runner connected."
 }
 
 # ---------------------------------------------------------------------------
@@ -349,30 +331,28 @@ wait_for_runner() {
 # Post-boot assertions: volume file exists and API confirms runner is online.
 # ---------------------------------------------------------------------------
 validate_container() {
-  echo ""
-  log_info "--- Validating deployment ---"
+  info ""
+  info "--- Validating deployment ---"
 
   # 1. .runner file in volume
   if runner_is_registered; then
-    log_ok ".runner file present in volume"
+    ok ".runner file present in volume"
   else
-    log_fail ".runner file missing from volume"
-    exit 1
+    die ".runner file missing from volume"
   fi
 
   # 2. Runner daemon confirmed connection in logs
   if $CONTAINER_RUNTIME logs forgejo-runner 2>&1 | grep -q "declared successfully"; then
-    log_ok "Runner daemon declared itself to Forgejo"
+    ok "Runner daemon declared itself to Forgejo"
   else
-    log_fail "Runner daemon has not declared itself — check: $CONTAINER_RUNTIME logs forgejo-runner"
-    exit 1
+    die "Runner daemon has not declared itself — check: $CONTAINER_RUNTIME logs forgejo-runner"
   fi
 
-  log_ok "--- All checks passed ---"
-  echo ""
-  log_info "Forgejo:        ${FORGEJO_HOST_URL}"
-  log_info "Actions UI:     ${FORGEJO_HOST_URL}/-/admin/runners"
-  log_info "Runner logs:    $CONTAINER_RUNTIME logs -f forgejo-runner"
+  ok "--- All checks passed ---"
+  info ""
+  info "Forgejo:        ${FORGEJO_HOST_URL}"
+  info "Actions UI:     ${FORGEJO_HOST_URL}/-/admin/runners"
+  info "Runner logs:    $CONTAINER_RUNTIME logs -f forgejo-runner"
 }
 
 
@@ -389,7 +369,7 @@ start_watcher() {
   local log_file="${repo_root}/watcher.log"
 
   if [[ ! -f "$watcher" ]]; then
-    log_warn "watch-mirrors.sh not found at ${watcher} — skipping watcher start."
+    warn "watch-mirrors.sh not found at ${watcher} — skipping watcher start."
     return
   fi
 
@@ -398,20 +378,20 @@ start_watcher() {
     local old_pid
     old_pid=$(cat "$pid_file")
     if kill -0 "$old_pid" 2>/dev/null; then
-      log_info "Stopping existing watcher (PID ${old_pid})..."
+      info "Stopping existing watcher (PID ${old_pid})..."
       kill "$old_pid" 2>/dev/null || true
       sleep 1
     fi
     rm -f "$pid_file"
   fi
 
-  log_info "Starting mirror watcher in background..."
+  info "Starting mirror watcher in background..."
   nohup bash "$watcher" >> "$log_file" 2>&1 &
   local watcher_pid=$!
   echo "$watcher_pid" > "$pid_file"
-  log_ok "Mirror watcher started (PID ${watcher_pid})"
-  log_info "  Logs: tail -f ${log_file}"
-  log_info "  Stop: kill \$(cat watcher.pid)"
+  ok "Mirror watcher started (PID ${watcher_pid})"
+  info "  Logs: tail -f ${log_file}"
+  info "  Stop: kill \$(cat watcher.pid)"
 }
 
 # ---------------------------------------------------------------------------
@@ -438,7 +418,7 @@ main() {
   if [[ "$skip_watcher" == false ]]; then
     start_watcher
   else
-    log_info "Skipping watcher start (--no-watcher). Managed externally (e.g. systemd)."
+    info "Skipping watcher start (--no-watcher). Managed externally (e.g. systemd)."
   fi
 }
 
