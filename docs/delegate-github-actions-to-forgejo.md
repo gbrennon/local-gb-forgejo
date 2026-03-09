@@ -189,7 +189,8 @@ git push http://${FORGEJO_ADMIN_USER}:${FORGEJO_ADMIN_PASSWORD}@localhost:1234/$
 
 ## Step 7 (Optional but Recommended) — Set Up a Webhook for Instant Sync
 
-Without a webhook, the mirror polls GitHub every 8 hours. A webhook makes Forgejo sync within seconds of a GitHub push.
+Without a webhook, the mirror polls GitHub every 8 hours.
+A webhook makes Forgejo sync within seconds of a GitHub push.
 
 **Requirement:** Forgejo must be reachable from the internet. Use a tunnel:
 
