@@ -134,7 +134,7 @@ fi
 # ---------------------------------------------------------------------------
 step "Step 5 — Scanning workflow files for required secrets"
 
-forgejo_scan_secrets "$OWNER_REPO"
+forgejo_report_missing_secrets "$OWNER_REPO"
 
 # ---------------------------------------------------------------------------
 # Step 6 — Summary
