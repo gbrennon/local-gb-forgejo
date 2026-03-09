@@ -159,11 +159,27 @@ start_core_services() {
 # wait_for_forgejo
 # ---------------------------------------------------------------------------
 wait_for_forgejo() {
-  log_info "Waiting for Forgejo to be healthy..."
+  log_info "Waiting for Forgejo container to be healthy..."
   until $CONTAINER_RUNTIME inspect --format='{{.State.Health.Status}}' forgejo 2>/dev/null | grep -q "healthy"; do
     sleep 3
     log_info "still waiting..."
   done
+
+  # Container is healthy but app.ini may not be written yet (INSTALL_LOCK boots
+  # it automatically). Gate on the API actually responding before using the CLI.
+  log_info "Waiting for Forgejo API to be ready..."
+  local retries=20
+  local i=0
+  until curl -sf "${FORGEJO_HOST_URL}/api/v1/version" >/dev/null 2>&1; do
+    sleep 3
+    i=$((i + 1))
+    if [[ $i -ge $retries ]]; then
+      log_error "Forgejo API did not become ready — check: $CONTAINER_RUNTIME logs forgejo"
+      exit 1
+    fi
+    log_info "API not ready yet... (${i}/${retries})"
+  done
+
   log_info "Forgejo is ready."
 }
 
@@ -183,17 +199,33 @@ runner_is_registered() {
 
 # ---------------------------------------------------------------------------
 # ensure_admin_user
+# Returns 0 if the admin user was NEWLY created (Forgejo is fresh).
+# Returns 1 if the admin user already existed.
+# Exits the script on any unexpected failure.
 # ---------------------------------------------------------------------------
 ensure_admin_user() {
   log_info "Ensuring Forgejo admin user exists..."
-  $CONTAINER_RUNTIME exec --user git forgejo \
+  local output exit_code=0
+  output=$($CONTAINER_RUNTIME exec --user git forgejo \
     forgejo admin user create \
       --username "${FORGEJO_ADMIN_USER}" \
       --password "${FORGEJO_ADMIN_PASSWORD}" \
       --email "${FORGEJO_ADMIN_USER}@local.dev" \
       --admin \
-      --must-change-password=false \
-    2>&1 | grep -v -E "already exists|name is reserved" || true
+      --must-change-password=false 2>&1) || exit_code=$?
+
+  if echo "$output" | grep -qE "already exists|name is reserved"; then
+    log_info "Admin user '${FORGEJO_ADMIN_USER}' already exists."
+    return 1
+  fi
+
+  if [[ $exit_code -ne 0 ]]; then
+    log_error "Admin user creation failed (exit ${exit_code}): ${output}"
+    exit 1
+  fi
+
+  [[ -n "$output" ]] && log_info "$output"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -201,16 +233,31 @@ ensure_admin_user() {
 # Prints the token to stdout; all other output goes to stderr.
 # ---------------------------------------------------------------------------
 fetch_registration_token() {
-  log_info "Fetching runner registration token from Forgejo API..."
-  local token
-  token=$(curl -sf \
+  log_info "Fetching runner registration token from Forgejo API..." >&2
+  local tmpfile
+  tmpfile=$(mktemp)
+  local http_code
+  http_code=$(curl -s \
+    -o "$tmpfile" \
+    -w "%{http_code}" \
     -u "${FORGEJO_ADMIN_USER}:${FORGEJO_ADMIN_PASSWORD}" \
-    "${FORGEJO_HOST_URL}/api/v1/admin/runners/registration-token" \
-    | grep -o '"token":"[^"]*"' \
-    | cut -d'"' -f4)
+    "${FORGEJO_HOST_URL}/api/v1/admin/runners/registration-token")
+  local response
+  response=$(cat "$tmpfile")
+  rm -f "$tmpfile"
+
+  if [[ "$http_code" != "200" ]]; then
+    log_error "Token endpoint returned HTTP ${http_code} (expected 200)." >&2
+    log_error "Response body: ${response}" >&2
+    log_error "Hint: ensure admin user '${FORGEJO_ADMIN_USER}' exists and password is correct." >&2
+    exit 1
+  fi
+
+  local token
+  token=$(echo "$response" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
   if [[ -z "$token" ]]; then
-    log_error "failed to retrieve runner registration token."
+    log_error "Could not extract token from API response: ${response}" >&2
     exit 1
   fi
 
@@ -242,15 +289,28 @@ register_runner() {
 
 # ---------------------------------------------------------------------------
 # bootstrap_runner
-# Idempotent: skips registration if .runner already exists in the volume.
+# Idempotent: skips re-registration only when BOTH the .runner file exists
+# AND Forgejo has existing state (admin user already existed).
+# If Forgejo data was wiped (admin user newly created) but the runner volume
+# still has a stale .runner, the stale file is cleared and runner re-registers.
 # ---------------------------------------------------------------------------
 bootstrap_runner() {
-  if runner_is_registered; then
+  local forgejo_is_fresh=false
+  ensure_admin_user && forgejo_is_fresh=true || true
+
+  if ! $forgejo_is_fresh && runner_is_registered; then
     log_info "Runner already registered, skipping."
     return
   fi
 
-  ensure_admin_user
+  if $forgejo_is_fresh && runner_is_registered; then
+    log_info "Forgejo data reset detected — clearing stale runner credentials..."
+    $CONTAINER_RUNTIME run --rm \
+      -v "${RUNNER_VOLUME}:/data" \
+      busybox \
+      rm -f "${RUNNER_STATE_FILE}" 2>/dev/null || true
+  fi
+
   local token
   token=$(fetch_registration_token)
   register_runner "$token"
@@ -317,9 +377,55 @@ validate_container() {
 
 
 # ---------------------------------------------------------------------------
+# start_watcher
+# Launches watch-mirrors.sh as a persistent background host process.
+# Idempotent: stops any existing watcher before starting a fresh one.
+# ---------------------------------------------------------------------------
+start_watcher() {
+  local repo_root
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local watcher="${repo_root}/scripts/watch-mirrors.sh"
+  local pid_file="${repo_root}/watcher.pid"
+  local log_file="${repo_root}/watcher.log"
+
+  if [[ ! -f "$watcher" ]]; then
+    log_warn "watch-mirrors.sh not found at ${watcher} — skipping watcher start."
+    return
+  fi
+
+  # Stop any previously running watcher
+  if [[ -f "$pid_file" ]]; then
+    local old_pid
+    old_pid=$(cat "$pid_file")
+    if kill -0 "$old_pid" 2>/dev/null; then
+      log_info "Stopping existing watcher (PID ${old_pid})..."
+      kill "$old_pid" 2>/dev/null || true
+      sleep 1
+    fi
+    rm -f "$pid_file"
+  fi
+
+  log_info "Starting mirror watcher in background..."
+  nohup bash "$watcher" >> "$log_file" 2>&1 &
+  local watcher_pid=$!
+  echo "$watcher_pid" > "$pid_file"
+  log_ok "Mirror watcher started (PID ${watcher_pid})"
+  log_info "  Logs: tail -f ${log_file}"
+  log_info "  Stop: kill \$(cat watcher.pid)"
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 main() {
+  # Parse flags
+  local skip_watcher=false
+  for arg in "$@"; do
+    case "$arg" in
+      --no-watcher) skip_watcher=true ;;
+    esac
+  done
+
   load_env
   detect_runtime
   start_core_services
@@ -328,6 +434,12 @@ main() {
   start_runner
   wait_for_runner
   validate_container
+
+  if [[ "$skip_watcher" == false ]]; then
+    start_watcher
+  else
+    log_info "Skipping watcher start (--no-watcher). Managed externally (e.g. systemd)."
+  fi
 }
 
 main "$@"
