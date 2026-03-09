@@ -1,3 +1,5 @@
 .env
 forgejo_secret.txt
 ngrok/ngrok.yml
+watcher.pid
+watcher.log
