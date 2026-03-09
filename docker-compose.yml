@@ -18,6 +18,9 @@ services:
       - FORGEJO__database__PASSWD=${POSTGRES_PASSWORD}
       - FORGEJO__actions__ENABLED=true
       - FORGEJO__actions__RUNNER_MODE=docker
+      - FORGEJO__security__INSTALL_LOCK=true
+      - FORGEJO__server__ROOT_URL=http://forgejo.local/
+      - FORGEJO__server__DOMAIN=localhost
     depends_on:
       forgejo-db:
         condition: service_healthy
