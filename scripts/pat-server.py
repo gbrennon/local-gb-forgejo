@@ -33,14 +33,6 @@ def load_pat_from_envfile(env_path: pathlib.Path):
 
 
 class PATHandler(BaseHTTPRequestHandler):
-    def _set_headers(self, code=200, content_type='text/plain'):
-        self.send_response(code)
-        self.send_header('Content-type', content_type)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.end_headers()
-
     def do_OPTIONS(self):
         self._set_headers()
 
@@ -66,6 +58,14 @@ class PATHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Reduce noise: print minimal logs.
         print("[pat-server] " + (format % args))
+
+    def _set_headers(self, code=200, content_type='text/plain'):
+        self.send_response(code)
+        self.send_header('Content-type', content_type)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
 
 
 if __name__ == '__main__':
