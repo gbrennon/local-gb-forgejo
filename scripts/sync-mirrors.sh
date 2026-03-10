@@ -12,6 +12,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/forgejo-api.sh
 source "${SCRIPT_DIR}/lib/forgejo-api.sh"
+# shellcheck source=lib/git-sync.sh
+source "${SCRIPT_DIR}/lib/git-sync.sh"
 
 # ---------------------------------------------------------------------------
 # Usage
@@ -57,41 +59,67 @@ if [[ -n "$TARGET_REPO" ]]; then
   # ---------------------------------------------------------------------------
   # Sync a single named repo
   # ---------------------------------------------------------------------------
-  step "Syncing mirror: ${TARGET_REPO}"
-  forgejo_trigger_sync "$TARGET_REPO"
-  ok "Sync triggered for ${TARGET_REPO}"
+  step "Syncing repo: ${TARGET_REPO}"
+  if git_push_sync "$TARGET_REPO"; then
+    ok "Sync complete for ${TARGET_REPO}"
+  else
+    warn "Sync failed — check that ${TARGET_REPO} is a push repo (not a pull mirror)."
+    warn "Convert pull mirrors with: ./scripts/mirror-repo.sh <org> ${TARGET_REPO##*/}"
+    exit 1
+  fi
 
 else
   # ---------------------------------------------------------------------------
   # Discover and sync all mirrors
   # ---------------------------------------------------------------------------
-  step "Discovering all mirrors in Forgejo"
+  step "Discovering repos to sync"
 
-  mapfile -t mirrors < <(forgejo_list_mirrors)
+  # Merge push repos and legacy pull mirrors; warn on pull mirrors.
+  mapfile -t all_repos < <({ forgejo_list_push_repos; forgejo_list_mirrors; } | sort -u)
 
-  if [[ ${#mirrors[@]} -eq 0 ]]; then
-    warn "No mirrors found. Use ./scripts/mirror-repo.sh <org> <repo> to add one."
+  if [[ ${#all_repos[@]} -eq 0 ]]; then
+    warn "No repos found. Use ./scripts/mirror-repo.sh <org> <repo> to add one."
     exit 0
   fi
 
-  ok "Found ${#mirrors[@]} mirror(s):"
-  printf '    %s\n' "${mirrors[@]}"
+  ok "Found ${#all_repos[@]} repo(s):"
+  printf '    %s\n' "${all_repos[@]}"
 
-  step "Triggering sync on all mirrors"
+  step "Syncing all repos"
 
   failed=()
-  for repo in "${mirrors[@]}"; do
-    if forgejo_trigger_sync "$repo" 2>/dev/null; then
-      ok "  ${repo}"
-    else
-      warn "  ${repo} — sync request failed"
-      failed+=("$repo")
+  for repo in "${all_repos[@]}"; do
+    is_mirror=$(curl -sf -u "${AUTH}" "${FORGEJO_HOST}/api/v1/repos/${repo}" \
+      | python3 -c "import sys,json; print(json.load(sys.stdin).get('mirror', False))" 2>/dev/null || echo "false")
+    if [[ "$is_mirror" == "True" ]]; then
+      step "  ${repo} — pull mirror: attempting mirror-sync via Forgejo API"
+      if mirror_resp=$(forgejo_trigger_sync "$repo" 2>&1); then
+        ok "  ${repo} — mirror-sync requested"
+        # show branches if any
+        mapfile -t branches < <(forgejo_list_branches "$repo")
+        if [[ ${#branches[@]} -gt 0 ]]; then
+          printf '    branches: %s\n' "${branches[*]}"
+        else
+          printf '    branches: none\n'
+        fi
+      else
+        warn "  ${repo} — mirror-sync failed: ${mirror_resp}";
+        failed+=("$repo")
+      fi
+      continue
     fi
+
+    sync_out=$(git_push_sync "$repo" 2>&1) || {
+      warn "  ${repo} — sync failed: $(echo "$sync_out" | tr '\n' ' ' | cut -c1-300)"
+      failed+=("$repo")
+      continue
+    }
+    ok "  ${repo} — ${sync_out}"
   done
 
   echo ""
   if [[ ${#failed[@]} -eq 0 ]]; then
-    ok "All ${#mirrors[@]} mirror(s) queued for sync."
+    ok "All ${#all_repos[@]} repo(s) synced."
   else
     warn "${#failed[@]} repo(s) failed: ${failed[*]}"
     exit 1
@@ -99,5 +127,5 @@ else
 fi
 
 info ""
-info "Forgejo re-syncs mirrors automatically every 1 minute."
+info "watch-mirrors.sh re-syncs repos automatically every 1 minute via git push."
 info "Monitor mirrors: ${FORGEJO_HOST}/-/admin/repos"

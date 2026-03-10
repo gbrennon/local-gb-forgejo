@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
-# mirror-repo.sh — Register a GitHub repository as a 1-minute mirror in Forgejo.
+# mirror-repo.sh — Register a GitHub repository for push-based sync with Forgejo.
+#
+# Creates a regular Forgejo repo (not a pull mirror) and performs an initial
+# git push from GitHub. Subsequent syncs are handled by watch-mirrors.sh, which
+# pushes commits to Forgejo and triggers Forgejo Actions workflows.
+#
+# If a pull mirror already exists for the same repo, it is converted automatically
+# (deleted and recreated as a regular repo — git history is preserved via push).
 #
 # Usage: ./scripts/mirror-repo.sh <github_org> <repo>
 #
-# This is idempotent: safe to re-run if the mirror already exists.
+# This is idempotent: safe to re-run if the repo already exists.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/forgejo-api.sh
 source "${SCRIPT_DIR}/lib/forgejo-api.sh"
+# shellcheck source=lib/git-sync.sh
+source "${SCRIPT_DIR}/lib/git-sync.sh"
 
 # ---------------------------------------------------------------------------
 # Usage
@@ -53,7 +62,7 @@ REPO="$2"
 
 load_env
 
-OWNER_REPO="${FORGEJO_ADMIN_USER}/${REPO}"
+OWNER_REPO="${ORG}/${REPO}"
 
 # ---------------------------------------------------------------------------
 # Step 1 — Prerequisites
@@ -72,61 +81,106 @@ fi
 # ---------------------------------------------------------------------------
 # Step 2 — Create the mirror
 # ---------------------------------------------------------------------------
-step "Step 2 — Mirroring github.com/${ORG}/${REPO} into Forgejo"
+step "Step 2 — Setting up github.com/${ORG}/${REPO} in Forgejo"
 
-result=$(forgejo_create_mirror "$ORG" "$REPO")
+# If a pull mirror already exists, convert it to a push-based repo.
+# Pull mirrors do not fire push events, so Actions never trigger on them.
+existing_type=$(curl -sf -u "${AUTH}" "${FORGEJO_HOST}/api/v1/repos/${OWNER_REPO}" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('mirror' if d.get('mirror') else 'repo')" 2>/dev/null || echo "none")
+
+if [[ "$existing_type" == "mirror" ]]; then
+  warn "Pull mirror detected — converting to push-based repo (git history is preserved)..."
+  forgejo_delete_repo "$OWNER_REPO"
+  existing_type="none"
+fi
+
+result=$(forgejo_create_push_repo "$ORG" "$REPO")
 if [[ "$result" == "exists" ]]; then
-  ok "Mirror already exists for ${OWNER_REPO}"
+  ok "Repo already exists: ${OWNER_REPO}"
 else
-  ok "Mirror created: ${result}"
+  ok "Repo created: ${result}"
+fi
+
+# Ensure Actions is enabled (create_push_repo does not set this automatically).
+if forgejo_enable_actions "$OWNER_REPO"; then
+  ok "Actions enabled for ${OWNER_REPO}"
+else
+  warn "Could not enable Actions for ${OWNER_REPO} — enable manually in repo Settings → Actions"
 fi
 
 # ---------------------------------------------------------------------------
 # Step 3 — Trigger first sync and verify branches
 # ---------------------------------------------------------------------------
-step "Step 3 — Triggering first sync"
+step "Step 3 — Pushing branches and tags from GitHub to Forgejo"
 
-# Forgejo needs time after mirror creation to finish its internal setup
-# before it accepts sync requests. Retry until the API accepts (up to 30s).
-sync_ok=false
-for _attempt in 1 2 3 4 5 6; do
-  sleep 5
-  if forgejo_trigger_sync "$OWNER_REPO" 2>/dev/null; then
-    sync_ok=true
-    break
+if git_init_push "$OWNER_REPO" "${ORG}/${REPO}"; then
+  ok "Push complete"
+  # Poll for action runs (give Forgejo a short window to queue workflows)
+  attempts=0
+  runs=""
+  while [[ $attempts -lt 6 ]]; do
+    runs=$(forgejo_list_recent_runs "$OWNER_REPO" 5)
+    if [[ "$runs" != "no_runs" && -n "$runs" ]]; then
+      break
+    fi
+    attempts=$((attempts + 1))
+    sleep 3
+  done
+  if [[ "$runs" == "no_runs" || -z "$runs" ]]; then
+    warn "No action runs detected after initial push — dumping workflow diagnostics"
+    for path in ".forgejo/workflows" ".github/workflows"; do
+      mapfile -t wf < <(forgejo_list_workflow_files "$OWNER_REPO" "$path")
+      if [[ ${#wf[@]} -gt 0 ]]; then
+        ok "Found workflow files in $path:"
+        for f in "${wf[@]}"; do
+          printf '    %s\n' "$f"
+          curl -sf -u "${AUTH}" "${FORGEJO_HOST}/api/v1/repos/${OWNER_REPO}/contents/${path}/${f}" \
+            | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print('\n'.join(base64.b64decode(d.get('content','')).decode().splitlines()[:30]))" 2>/dev/null || echo '      (could not fetch)'
+        done
+      fi
+    done
+    echo 'Raw runs API response:'
+    curl -s -u "${AUTH}" "${FORGEJO_HOST}/api/v1/repos/${OWNER_REPO}/actions/tasks?limit=10" | sed -n '1,200p'
+  else
+    ok "Action runs detected after initial push:"
+    while IFS=$'\t' read -r status name branch sha; do
+      printf '    %s  %s @ %s\n' "$status" "$name" "$branch"
+    done <<< "$runs"
   fi
-  info "Waiting for mirror to become ready... (${_attempt}/6)"
-done
-if ! $sync_ok; then
-  warn "Could not trigger sync — mirror may still be initializing."
-  info "Trigger manually later: ./scripts/sync-mirrors.sh ${OWNER_REPO}"
 else
-  ok "Sync request sent"
-  info "Waiting 15 seconds for sync to complete..."
-  sleep 15
+  warn "Push failed — check your GITHUB_PAT and network connectivity."
+  info "Retry manually: ./scripts/sync-mirrors.sh ${OWNER_REPO}"
 fi
 
+sleep 3  # give Forgejo time to index pushed refs before listing them
 mapfile -t branches < <(forgejo_list_branches "$OWNER_REPO")
 if [[ ${#branches[@]} -gt 0 ]]; then
-  ok "Branches fetched:"
+  ok "Branches available:"
   printf '    branch: %s\n' "${branches[@]}"
 else
-  warn "No branches found yet — sync may still be in progress."
-  info "Trigger manually: ./scripts/sync-mirrors.sh ${OWNER_REPO}"
+  warn "No branches found — push may have failed silently."
 fi
 
 # ---------------------------------------------------------------------------
 # Step 4 — Confirm workflow files are present
 # ---------------------------------------------------------------------------
-step "Step 4 — Checking .github/workflows/"
+step "Step 4 — Checking workflow files"
 
-mapfile -t workflow_files < <(forgejo_list_workflow_files "$OWNER_REPO")
-if [[ ${#workflow_files[@]} -gt 0 ]]; then
-  ok "Workflow files found:"
-  printf '    %s\n' "${workflow_files[@]}"
-else
-  warn ".github/workflows/ not found or empty."
-  info "For GitLab/Bitbucket mirrors, create .forgejo/workflows/ci.yml manually."
+mapfile -t wf_github < <(forgejo_list_workflow_files "$OWNER_REPO" ".github/workflows")
+mapfile -t wf_forgejo < <(forgejo_list_workflow_files "$OWNER_REPO" ".forgejo/workflows")
+workflow_files=("${wf_forgejo[@]}" "${wf_github[@]}")
+
+if [[ ${#wf_forgejo[@]} -gt 0 ]]; then
+  ok ".forgejo/workflows/ (Forgejo-native, takes precedence):"
+  printf '    %s\n' "${wf_forgejo[@]}"
+fi
+if [[ ${#wf_github[@]} -gt 0 ]]; then
+  ok ".github/workflows/ (GitHub Actions compat):"
+  printf '    %s\n' "${wf_github[@]}"
+fi
+if [[ ${#workflow_files[@]} -eq 0 ]]; then
+  warn "No workflow files found in .forgejo/workflows/ or .github/workflows/."
+  info "Create .forgejo/workflows/ci.yml to define your CI pipeline."
 fi
 
 # ---------------------------------------------------------------------------
@@ -143,6 +197,9 @@ step "Step 6 — Done"
 ok "Mirror:   ${FORGEJO_HOST}/${OWNER_REPO}"
 ok "Actions:  ${FORGEJO_HOST}/${OWNER_REPO}/actions"
 info ""
-info "Mirror syncs automatically every 1 minute."
+info "Repo syncs automatically every 1 minute via watch-mirrors.sh."
 info "To trigger an immediate sync:"
 info "  ./scripts/sync-mirrors.sh ${OWNER_REPO}"
+info ""
+info "Each sync pushes new commits to Forgejo, which fires push events"
+info "and triggers Forgejo Actions workflows automatically."

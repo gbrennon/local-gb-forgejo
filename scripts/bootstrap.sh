@@ -8,6 +8,7 @@ SECRET_FILE="forgejo_secret.txt"
 RUNNER_STATE_FILE="/data/.runner"
 FORGEJO_HOST_PORT="1234"
 FORGEJO_ADMIN_USER="${FORGEJO_ADMIN_USER:-forgejo_admin}"
+RUNNER_IMAGE="data.forgejo.org/forgejo/runner:9"
 
 # Derive the compose project name the same way podman-compose / docker compose
 # does: $COMPOSE_PROJECT_NAME env var, else basename of the working directory.
@@ -135,6 +136,11 @@ compose_up() {
 # ---------------------------------------------------------------------------
 start_core_services() {
   compose_up forgejo forgejo-db
+  # podman-compose starts ALL services in the pod regardless of the arguments
+  # passed to 'up'. Stop the runner container immediately so it cannot race
+  # against the registration step (it has no valid token yet and would
+  # corrupt Forgejo's token state before bootstrap can register properly).
+  $CONTAINER_RUNTIME stop forgejo-runner 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -215,7 +221,7 @@ ensure_admin_user() {
 # Prints the token to stdout; all other output goes to stderr.
 # ---------------------------------------------------------------------------
 fetch_registration_token() {
-  info "Fetching runner registration token from Forgejo API..."
+  info "Fetching runner registration token from Forgejo API..." >&2
   local tmpfile
   tmpfile=$(mktemp)
   local http_code
@@ -249,23 +255,33 @@ fetch_registration_token() {
 # ---------------------------------------------------------------------------
 # register_runner <token>
 # Generates config and registers the runner, writing .runner into /data.
-# Uses -w /data so the runner writes .runner to the persisted volume path
-# without needing --runner-file (unsupported in runner:9).
+# Runs the registration container on the compose network so that:
+#   1. The runner can resolve "forgejo" by container name (same as runtime).
+#   2. The instance URL written into config.yml is http://forgejo:3000, which
+#      the runner daemon also uses — no post-registration patching needed.
+# This works identically for podman and docker because both runtimes create a
+# "<project>_default" bridge network for the compose stack.
 # ---------------------------------------------------------------------------
 register_runner() {
   local token="$1"
+  local compose_network="${COMPOSE_PROJECT_NAME}_default"
 
   echo "$token" > "$SECRET_FILE"
   info "Token saved to $SECRET_FILE"
 
-  $COMPOSE run --rm -w /data forgejo-runner \
+  $CONTAINER_RUNTIME run --rm \
+    -v "${RUNNER_VOLUME}:/data" \
+    -w /data \
+    --user 0:0 \
+    --network "$compose_network" \
+    "$RUNNER_IMAGE" \
     sh -c "forgejo-runner generate-config > /data/config.yml && \
       forgejo-runner register \
         -c /data/config.yml \
         --no-interactive \
-        --instance '$FORGEJO_INTERNAL_URL' \
+        --instance 'http://forgejo:3000' \
         --name local-runner \
-        --token '$token' \
+        --token '${token}' \
         --labels ubuntu-latest,linux/amd64"
 }
 
@@ -296,6 +312,22 @@ bootstrap_runner() {
   local token
   token=$(fetch_registration_token)
   register_runner "$token"
+  patch_runner_config
+}
+
+# ---------------------------------------------------------------------------
+# patch_runner_config
+# Sets container.network in config.yml so that job containers are attached to
+# the compose network and can resolve the "forgejo" hostname by container name.
+# Must be called after register_runner (which regenerates config.yml).
+# ---------------------------------------------------------------------------
+patch_runner_config() {
+  local compose_network="${COMPOSE_PROJECT_NAME}_default"
+  info "Patching runner config.yml: container.network = ${compose_network}"
+  $CONTAINER_RUNTIME run --rm \
+    -v "${RUNNER_VOLUME}:/data" \
+    busybox \
+    sed -i "s|^  network: \"\"$|  network: \"${compose_network}\"|" /data/config.yml
 }
 
 # ---------------------------------------------------------------------------
@@ -364,7 +396,7 @@ validate_container() {
 start_watcher() {
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local watcher="${repo_root}/scripts/watch-mirrors.sh"
+  local watcher="${repo_root}/watch-mirrors.sh"
   local pid_file="${repo_root}/watcher.pid"
   local log_file="${repo_root}/watcher.log"
 
