@@ -4,8 +4,12 @@
 # back to GitHub so results appear on GitHub commits and PRs.
 #
 # Flow:
-#   GitHub push → mirror-sync (this script) → Forgejo detects change
-#     → Forgejo Actions fires → watcher reads result → GitHub Commit Status API
+#   GitHub push → watcher fetches + pushes to Forgejo (this script)
+#     → Forgejo receives real push event → Forgejo Actions fires
+#     → watcher reads result → GitHub Commit Status API
+#
+# Why git push and not mirror-sync: Forgejo pull mirror syncs do NOT fire
+# push events, so Actions never trigger. Real git pushes do.
 #
 # Usage:
 #   ./scripts/watch-mirrors.sh                   # watch ALL mirrors, 60s interval
@@ -18,6 +22,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/forgejo-api.sh
 source "${SCRIPT_DIR}/lib/forgejo-api.sh"
+# shellcheck source=lib/git-sync.sh
+source "${SCRIPT_DIR}/lib/git-sync.sh"
 # shellcheck source=lib/github-api.sh
 source "${SCRIPT_DIR}/lib/github-api.sh"
 
@@ -161,7 +167,7 @@ report_runs_to_github() {
   _state_prune
 
   local posted=0
-  while IFS=$'\t' read -r status name branch sha; do
+  while IFS=$'\t' read -r status name branch sha run_url; do
     if [[ -z "$sha" ]]; then continue; fi
 
     local gh_state
@@ -187,28 +193,35 @@ report_runs_to_github() {
   done <<< "$runs"
 
   if [[ $posted -gt 0 ]]; then
-    printf '         → %d status(es) posted to GitHub\n' "$posted"
+    printf '         → %d GitHub status(es) posted (%s)\n' "$posted" "$github_slug"
   fi
 }
 
 # ---------------------------------------------------------------------------
 # print_run_status <repo>
 # Shows the last few Forgejo Actions runs for the repo.
+# For failed runs, prints the Forgejo UI URL so the user can inspect logs.
 # ---------------------------------------------------------------------------
 print_run_status() {
   local repo="$1"
   local runs
-  runs=$(forgejo_list_recent_runs "$repo" 3)
+  runs=$(forgejo_list_recent_runs "$repo" 5)
 
   if [[ "$runs" == "no_runs" ]] || [[ -z "$runs" ]]; then
+    printf '         ·  no action runs yet\n'
     return
   fi
 
-  while IFS=$'\t' read -r status name branch sha; do
+  while IFS=$'\t' read -r status name branch sha run_url; do
     local icon short_sha
     icon=$(run_icon "$status")
     short_sha="${sha:0:7}"
-    printf '         %s  %-10s  %s  (%s@%s)\n' "$icon" "$status" "$name" "$branch" "$short_sha"
+    # Prefix with [CI] to make clear this is a Forgejo Actions job result, not a script error
+    printf '         [CI] %s  %-10s  %-30s  %s @ %s\n' "$icon" "$status" "$name" "$short_sha" "$branch"
+
+    if [[ "$status" == "failure" || "$status" == "error" ]] && [[ -n "$run_url" ]]; then
+      printf '               └─ logs: %s\n' "$run_url"
+    fi
   done <<< "$runs"
 }
 
@@ -220,7 +233,9 @@ resolve_repos() {
   if [[ -n "$REPOS_FILTER" ]]; then
     tr ',' '\n' <<< "$REPOS_FILTER"
   else
-    forgejo_list_mirrors
+    # Include both push repos (managed by this toolchain) and legacy pull mirrors.
+    # Pull mirrors are flagged with a warning; push repos use git_push_sync.
+    { forgejo_list_push_repos; forgejo_list_mirrors; } | sort -u
   fi
 }
 
@@ -231,32 +246,90 @@ resolve_repos() {
 sync_cycle() {
   local cycle="$1"
   local timestamp
-  timestamp=$(date '+%H:%M:%S')
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-  mapfile -t repos < <(resolve_repos)
+  local push_repos mirror_repos
+  push_repos=$(forgejo_list_push_repos)
+  mirror_repos=$(forgejo_list_mirrors)
 
-  if [[ ${#repos[@]} -eq 0 ]]; then
-    warn "No mirrors found. Use ./scripts/mirror-repo.sh <org> <repo> to add one."
+  local all_repos=()
+  while IFS= read -r r; do [[ -n "$r" ]] && all_repos+=("$r"); done <<< "$push_repos"
+  while IFS= read -r r; do [[ -n "$r" ]] && all_repos+=("$r"); done <<< "$mirror_repos"
+
+  if [[ ${#all_repos[@]} -eq 0 ]]; then
+    warn "No repos found. Use ./scripts/mirror-repo.sh <org> <repo> to add one."
     return
   fi
 
+  local push_count=0
+  [[ -n "$push_repos" ]] && push_count=$(echo "$push_repos" | grep -c .) || push_count=0
+
   echo ""
-  echo "==> [${timestamp}] Cycle #${cycle} — ${#repos[@]} mirror(s)"
+  echo "────────────────────────────────────────────────────────"
+  echo "  ${timestamp}  |  Cycle #${cycle}  |  ${#all_repos[@]} repo(s)"
+  echo "────────────────────────────────────────────────────────"
 
   local failed=()
-  for repo in "${repos[@]}"; do
-    if forgejo_trigger_sync "$repo" 2>/dev/null; then
-      printf '    [OK] %-30s synced\n' "$repo"
+  declare -A fail_msgs=()
+  for repo in "${all_repos[@]}"; do
+    # Pull mirrors: Forgejo does not fire push events on mirror syncs so Actions
+    # never trigger. Auto-convert in place: delete the mirror and recreate as a
+    # regular repo under the same owner, then push from GitHub.
+    if echo "$mirror_repos" | grep -qx "$repo"; then
+      printf '    [..] %-32s pull mirror detected — auto-converting to push repo\n' "$repo"
+      local conv_slug
+      conv_slug=$(forgejo_convert_mirror_to_push "$repo" 2>&1) || {
+        printf '    [!!] %-32s conversion failed: %s\n' "$repo" "$conv_slug" >&2
+        failed+=("$repo")
+        fail_msgs["$repo"]="$conv_slug"
+        continue
+      }
+      printf '    [OK] %-32s converted — pushing from github.com/%s\n' "$repo" "$conv_slug"
+      local push_out
+      push_out=$(git_init_push "$repo" "$conv_slug" 2>&1) || {
+        printf '    [!!] %-32s initial push failed: %s\n' "$repo" "$push_out" >&2
+        failed+=("$repo")
+        fail_msgs["$repo"]="$push_out"
+        continue
+      }
+      printf '    [OK] %-32s push complete — waiting for Actions to queue\n' "$repo"
+      sleep 4
       print_run_status "$repo"
       report_runs_to_github "$repo" || true
-    else
-      printf '    [!!] %-30s sync failed\n' "$repo" >&2
+      continue
+    fi
+
+    local github_slug sync_info
+    github_slug=$(forgejo_get_mirror_source "$repo")
+    local source_label="${github_slug:-unknown}"
+
+    sync_info=$(git_push_sync "$repo" 2>&1) || {
+      printf '    [!!] %-32s sync failed  ←  %s\n' "$repo" "$source_label" >&2
+      fail_msgs["$repo"]="$sync_info"
       failed+=("$repo")
+      continue
+    }
+
+    printf '    [OK] %-32s %s  ←  %s\n' "$repo" "$sync_info" "$source_label"
+    runs=$(forgejo_list_recent_runs "$repo" 5)
+    if [[ "$runs" == "no_runs" || -z "$runs" ]]; then
+      sleep 3
+      runs=$(forgejo_list_recent_runs "$repo" 5)
+    fi
+    if [[ "$runs" == "no_runs" || -z "$runs" ]]; then
+      printf '         ·  no action runs yet — check that workflow files exist in .forgejo/workflows/ or .github/workflows/\n'
+    else
+      print_run_status "$repo"
+      report_runs_to_github "$repo" || true
     fi
   done
 
   if [[ ${#failed[@]} -gt 0 ]]; then
-    warn "Failed to sync: ${failed[*]}"
+    warn "Failed: ${failed[*]}"
+    for r in "${failed[@]}"; do
+      msg="${fail_msgs[$r]:-no details available}"
+      printf '    [DETAIL] %-32s %s\n' "$r" "$(echo "$msg" | tr '\n' ' ' | cut -c1-400)" >&2
+    done
   fi
 }
 
@@ -266,7 +339,7 @@ sync_cycle() {
 on_exit() {
   echo ""
   echo "==> Watcher stopped."
-  echo "    Forgejo continues syncing automatically every 1 minute via mirror_interval."
+  echo "    Run ./scripts/watch-mirrors.sh to restart the daemon."
   echo "    Actions UI: ${FORGEJO_HOST}/-/admin/runners"
 }
 trap on_exit EXIT INT TERM
@@ -298,12 +371,12 @@ cycle=0
 
 while true; do
   cycle=$((cycle + 1))
-  sync_cycle "$cycle"
+  sync_cycle "$cycle" || true  # never let a failed cycle kill the watcher
 
   if [[ "$RUN_ONCE" == true ]]; then
     break
   fi
 
-  printf '\n    [--] Next sync in %ds...\n' "$INTERVAL"
+  printf '\n  ⏳ next sync in %ds\n' "$INTERVAL"
   sleep "$INTERVAL"
 done

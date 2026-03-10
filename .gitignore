@@ -4,3 +4,6 @@ ngrok/ngrok.yml
 watcher.pid
 watcher.log
 *.txt
+
+# Local git cache for push-based mirror sync
+runner-data/git-cache/
