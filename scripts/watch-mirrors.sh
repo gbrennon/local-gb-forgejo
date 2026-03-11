@@ -379,6 +379,14 @@ sync_cycle() {
       printf '    [DETAIL] %-32s %s\n' "$r" "$(echo "$msg" | tr '\n' ' ' | cut -c1-400)" >&2
     done
   fi
+
+  # Follow-up pass: report completed runs that were still "running" at push time.
+  # Runs without branch filter so all recent runs are checked.
+  # The state-file dedup skips already-reported (sha, context, state) combos and
+  # only fires when the outcome changes, e.g. pending -> success/failure.
+  for repo in "${all_repos[@]}"; do
+    report_runs_to_github "$repo" || true
+  done
 }
 
 # ---------------------------------------------------------------------------
