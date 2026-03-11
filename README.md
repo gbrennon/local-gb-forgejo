@@ -1,9 +1,13 @@
 # local-gb-forgejo
 
 A local [Forgejo](https://forgejo.org) instance that mirrors GitHub repositories and runs
-CI/CD via Forgejo Actions on a local runner. Results are posted back to GitHub as commit
-statuses so they appear on your PRs and commits — just like regular GitHub Actions, but
-running on your own machine.
+CI/CD via Forgejo Actions on a local runner.
+
+Results are posted back to GitHub as commit statuses so they appear on your PRs and commits — just like regular GitHub Actions,
+
+BUT
+
+running on your own machine :D
 
 ---
 

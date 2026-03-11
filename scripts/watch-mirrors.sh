@@ -28,16 +28,15 @@ source "${SCRIPT_DIR}/lib/git-sync.sh"
 source "${SCRIPT_DIR}/lib/github-api.sh"
 
 # ---------------------------------------------------------------------------
-# PID lock — only one instance may run at a time.
-# Placing the lock file at the repo root keeps it visible alongside watcher.log.
+# Exclusive lock — only one instance may run at a time.
+# flock(1) is atomic; the lock is released automatically when the process exits.
 # ---------------------------------------------------------------------------
+WATCHER_LOCK_FILE="${SCRIPT_DIR}/../watcher.lock"
 WATCHER_PID_FILE="${SCRIPT_DIR}/../watcher.pid"
-if [[ -f "$WATCHER_PID_FILE" ]]; then
-  _existing_pid=$(cat "$WATCHER_PID_FILE")
-  if kill -0 "$_existing_pid" 2>/dev/null; then
-    echo "watch-mirrors.sh is already running (PID ${_existing_pid}). Exiting." >&2
-    exit 1
-  fi
+exec 9>"$WATCHER_LOCK_FILE"
+if ! flock -n 9; then
+  echo "watch-mirrors.sh is already running. Exiting." >&2
+  exit 1
 fi
 echo $$ > "$WATCHER_PID_FILE"
 
@@ -164,7 +163,7 @@ _state_prune() {
 }
 
 # ---------------------------------------------------------------------------
-# report_runs_to_github <forgejo_owner/repo>
+# report_runs_to_github <forgejo_owner/repo> [branch_filter_csv]
 # Reads recent Forgejo Actions runs and posts their status to GitHub.
 # Tracks reported statuses to avoid duplicate API calls. Re-posts if the
 # status changes (e.g. failure → success after a re-run).
@@ -173,6 +172,7 @@ _state_prune() {
 # ---------------------------------------------------------------------------
 report_runs_to_github() {
   local forgejo_repo="$1"
+  local branch_filter="${2:-}"
 
   github_has_pat || return 0
 
@@ -181,7 +181,7 @@ report_runs_to_github() {
   if [[ -z "$github_slug" ]]; then return 0; fi
 
   local runs
-  runs=$(forgejo_list_recent_runs "$forgejo_repo" 20)
+  runs=$(forgejo_list_recent_runs "$forgejo_repo" 20 "$branch_filter")
   if [[ "$runs" == "no_runs" ]] || [[ -z "$runs" ]]; then return 0; fi
 
   _state_prune
@@ -215,14 +215,15 @@ report_runs_to_github() {
 }
 
 # ---------------------------------------------------------------------------
-# print_run_status <repo>
-# Shows the last few Forgejo Actions runs for the repo.
-# For failed runs, prints the Forgejo UI URL so the user can inspect logs.
+# print_run_status <repo> [branch_filter_csv]
+# Shows the last few Forgejo Actions runs for the repo, optionally filtered
+# to specific branches. For failed runs, prints inline log tail + URL.
 # ---------------------------------------------------------------------------
 print_run_status() {
   local repo="$1"
+  local branch_filter="${2:-}"
   local runs
-  runs=$(forgejo_list_recent_runs "$repo" 5)
+  runs=$(forgejo_list_recent_runs "$repo" 20 "$branch_filter")
 
   if [[ "$runs" == "no_runs" ]] || [[ -z "$runs" ]]; then
     printf '         .  no action runs yet\n'
@@ -284,18 +285,15 @@ sync_cycle() {
   while IFS= read -r r; do [[ -n "$r" ]] && all_repos+=("$r"); done <<< "$push_repos"
   while IFS= read -r r; do [[ -n "$r" ]] && all_repos+=("$r"); done <<< "$mirror_repos"
 
-  if [[ ${#all_repos[@]} -eq 0 ]]; then
-    warn "No repos found. Use ./scripts/mirror-repo.sh <org> <repo> to add one."
-    return
-  fi
-
-  local push_count=0
-  [[ -n "$push_repos" ]] && push_count=$(echo "$push_repos" | grep -c .) || push_count=0
-
   echo ""
   echo "--------------------------------------------------------"
   echo "  ${timestamp}  |  Cycle #${cycle}  |  ${#all_repos[@]} repo(s)"
   echo "--------------------------------------------------------"
+
+  if [[ ${#all_repos[@]} -eq 0 ]]; then
+    warn "No repos found. Use ./scripts/mirror-repo.sh <org> <repo> to add one."
+    return
+  fi
 
   local failed=()
   declare -A fail_msgs=()
@@ -327,29 +325,50 @@ sync_cycle() {
       continue
     fi
 
-    local github_slug sync_info
-    github_slug=$(forgejo_get_mirror_source "$repo")
+    local github_slug
+    github_slug=$(forgejo_get_mirror_source "$repo") || true
     local source_label="${github_slug:-unknown}"
 
-    sync_info=$(git_push_sync "$repo" 2>&1) || {
+    local raw_sync_out
+    raw_sync_out=$(git_push_sync "$repo" 2>&1) || {
       printf '    [!!] %-32s sync failed  <-  %s\n' "$repo" "$source_label" >&2
-      fail_msgs["$repo"]="$sync_info"
+      fail_msgs["$repo"]="$raw_sync_out"
       failed+=("$repo")
       continue
     }
 
+    # First line is the human-readable summary; remaining CHANGED: lines are branch names.
+    local sync_info changed_branches_csv
+    sync_info=$(echo "$raw_sync_out" | head -1)
+    changed_branches_csv=""
+    local changed_branches=()
+    while IFS= read -r out_line; do
+      if [[ "$out_line" == CHANGED:* ]]; then
+        changed_branches+=("${out_line#CHANGED:}")
+      fi
+    done <<< "$raw_sync_out"
+    if [[ ${#changed_branches[@]} -gt 0 ]]; then
+      changed_branches_csv=$(IFS=,; echo "${changed_branches[*]}")
+    fi
+
     printf '    [OK] %-32s %s  <-  %s\n' "$repo" "$sync_info" "$source_label"
 
-    runs=$(forgejo_list_recent_runs "$repo" 5)
+    # Only show CI and report to GitHub for branches that actually got new commits.
+    if [[ -z "$changed_branches_csv" ]]; then
+      continue
+    fi
+
+    local runs
+    runs=$(forgejo_list_recent_runs "$repo" 20 "$changed_branches_csv") || true
     if [[ "$runs" == "no_runs" || -z "$runs" ]]; then
       sleep 3
-      runs=$(forgejo_list_recent_runs "$repo" 5)
+      runs=$(forgejo_list_recent_runs "$repo" 20 "$changed_branches_csv") || true
     fi
     if [[ "$runs" == "no_runs" || -z "$runs" ]]; then
       printf '         .  no action runs yet - check that workflow files exist in .forgejo/workflows/ or .github/workflows/\n'
     else
-      print_run_status "$repo"
-      report_runs_to_github "$repo" || true
+      print_run_status "$repo" "$changed_branches_csv"
+      report_runs_to_github "$repo" "$changed_branches_csv" || true
     fi
   done
 
@@ -360,6 +379,14 @@ sync_cycle() {
       printf '    [DETAIL] %-32s %s\n' "$r" "$(echo "$msg" | tr '\n' ' ' | cut -c1-400)" >&2
     done
   fi
+
+  # Follow-up pass: report completed runs that were still "running" at push time.
+  # Runs without branch filter so all recent runs are checked.
+  # The state-file dedup skips already-reported (sha, context, state) combos and
+  # only fires when the outcome changes, e.g. pending -> success/failure.
+  for repo in "${all_repos[@]}"; do
+    report_runs_to_github "$repo" || true
+  done
 }
 
 # ---------------------------------------------------------------------------
