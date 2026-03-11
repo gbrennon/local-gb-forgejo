@@ -27,12 +27,23 @@ _forgejo_user_push_token() {
   mkdir -p "$_FORGEJO_TOKEN_CACHE_DIR"
   chmod 700 "$_FORGEJO_TOKEN_CACHE_DIR"
 
+  # Validate cached token with a lightweight API call before trusting it.
   if [[ -f "$cache_file" ]]; then
-    cat "$cache_file"
-    return 0
+    local cached_token
+    cached_token=$(cat "$cache_file")
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: token ${cached_token}" \
+      "${FORGEJO_HOST}/api/v1/user" 2>/dev/null || echo "000")
+    if [[ "$http_code" == "200" ]]; then
+      echo "$cached_token"
+      return 0
+    fi
+    # Token is stale — remove cache and fall through to re-create.
+    rm -f "$cache_file"
   fi
 
-  # Delete any stale token with this name before creating a fresh one.
+  # Delete any existing token with this name before creating a fresh one.
   local existing_id
   existing_id=$(curl -sf \
     -u "${AUTH}" \
@@ -158,12 +169,30 @@ git_push_sync() {
   fi
   git -C "$cache_dir" push forgejo --tags --force --quiet 2>/dev/null || true
 
-  # Lines starting with '=' are up-to-date; ' ' or '*' are updates/new branches.
-  local changed=0 total=0
+  # Total branch count from the local cache (authoritative — not from push output
+  # which can omit branches when the remote is already in sync).
+  local total
+  total=$(git -C "$cache_dir" show-ref --heads 2>/dev/null | wc -l | tr -d ' ')
+
+  # Parse porcelain: flag is the single first character of each ref line.
+  #   '=' → up to date   ' ' → fast-forward   '+' → forced   '*' → new ref
+  # Avoid bash case globs by slicing the first character explicitly.
+  local changed=0
+  local ref_field branch_name
+  local changed_branches=()
   while IFS= read -r line; do
-    case "$line" in
-      "="*) total=$((total + 1)) ;;
-      " "*|"*"*) changed=$((changed + 1)); total=$((total + 1)) ;;
+    local flag="${line:0:1}"
+    case "$flag" in
+      ' '|'+'|'*')
+        changed=$((changed + 1))
+        # Extract branch name: field 2 of tab-separated output, left side of ':'
+        ref_field=$(echo "$line" | awk -F'\t' '{print $2}')
+        branch_name="${ref_field%%:*}"
+        branch_name="${branch_name##refs/heads/}"
+        if [[ -n "$branch_name" ]]; then
+          changed_branches+=("$branch_name")
+        fi
+        ;;
     esac
   done <<< "$push_out"
 
@@ -171,6 +200,13 @@ git_push_sync() {
     echo "${changed}/${total} branch(es) updated"
   else
     echo "all ${total} branch(es) up to date"
+  fi
+
+  # Emit changed branch names for the caller (one per line, prefixed).
+  if [[ ${#changed_branches[@]} -gt 0 ]]; then
+    for b in "${changed_branches[@]}"; do
+      echo "CHANGED:${b}"
+    done
   fi
 }
 

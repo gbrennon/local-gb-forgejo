@@ -370,6 +370,8 @@ fs = json.load(sys.stdin)
 forgejo_list_recent_runs() {
   local owner_repo="$1"
   local limit="${2:-20}"
+  local branch_filter="${3:-}"   # optional comma-separated branch names to include
+
   curl -sf \
     -u "${AUTH}" \
     "${FORGEJO_HOST}/api/v1/repos/${owner_repo}/actions/tasks?limit=${limit}" \
@@ -380,8 +382,12 @@ runs = data.get('workflow_runs', [])
 if not runs:
     print('no_runs')
     sys.exit(0)
+
+branch_filter = set(b.strip() for b in '${branch_filter}'.split(',') if b.strip())
+
 # Deduplicate: keep only the first (most recent) run per (name, branch) pair.
 seen = set()
+any_printed = False
 for r in runs:
     status = r.get('status', 'unknown')
     conclusion = r.get('conclusion', '')
@@ -395,7 +401,13 @@ for r in runs:
     if key in seen:
         continue
     seen.add(key)
+    if branch_filter and branch not in branch_filter:
+        continue
     print(f'{final_status}\t{name}\t{branch}\t{sha}\t{run_url}\t{task_id}')
+    any_printed = True
+
+if not any_printed:
+    print('no_runs')
 " 2>/dev/null || echo "no_runs"
 }
 
