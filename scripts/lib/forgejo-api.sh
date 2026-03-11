@@ -362,7 +362,7 @@ fs = json.load(sys.stdin)
 # ---------------------------------------------------------------------------
 # forgejo_list_recent_runs <owner/repo> [limit]
 # Prints the most recent Actions run per (name, branch) pair.
-# Format: "<status>\t<name>\t<branch>\t<sha>\t<run_url>"
+# Format: "<status>\t<name>\t<branch>\t<sha>\t<run_url>\t<task_id>"
 # Uses /actions/tasks endpoint (Forgejo v11+; /actions/runs is not implemented).
 # Deduplicates: only the latest run per (workflow name + branch) is returned,
 # so stale pre-fix failures on old branches don't shadow current results.
@@ -389,13 +389,119 @@ for r in runs:
     branch = r.get('head_branch', '?')
     sha = r.get('head_sha', '')
     run_url = r.get('url', '')
+    task_id = str(r.get('id', ''))
     final_status = conclusion if conclusion else status
     key = (name, branch)
     if key in seen:
         continue
     seen.add(key)
-    print(f'{final_status}\t{name}\t{branch}\t{sha}\t{run_url}')
+    print(f'{final_status}\t{name}\t{branch}\t{sha}\t{run_url}\t{task_id}')
 " 2>/dev/null || echo "no_runs"
+}
+
+# ---------------------------------------------------------------------------
+# forgejo_get_task_log_tail <owner/repo> <task_id> [max_lines]
+# Reads the zstd-compressed log for a finished Actions task and prints the
+# most informative lines: error messages, step failures, and the final result.
+# Falls back silently if the log file doesn't exist yet.
+# ---------------------------------------------------------------------------
+forgejo_get_task_log_tail() {
+  local owner_repo="$1"
+  local task_id="$2"
+  local max_lines="${3:-8}"
+
+  local owner="${owner_repo%%/*}"
+  local repo="${owner_repo#*/}"
+  local hex_dir
+  hex_dir=$(python3 -c "print(format(int('${task_id}'), '02x'))")
+  local log_path="/data/gitea/actions_log/${owner}/${repo}/${hex_dir}/${task_id}.log.zst"
+
+  local runtime
+  runtime=$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)
+
+  "$runtime" exec forgejo cat "$log_path" 2>/dev/null \
+    | zstd -d -c 2>/dev/null \
+    | python3 -c "
+import sys, re
+
+NOISE = re.compile(
+    r'docker\s+(exec|cp|create|pull|run)'
+    r'|git\s+(config|version|init|submodule|remote|clone)\b'
+    r'|Temporarily overriding HOME'
+    r'|##\[(?:group|endgroup)\]'
+    r'|add-matcher'
+    r'|Syncing repository'
+    r'|Getting Git version'
+    r'|Working directory is'
+    r'|Deleting the contents'
+    r'|Initializing the repository'
+    r'|safe\.directory'
+    r'|includeIf'
+    r'|\[command\]'
+    r'|git global config'
+    r'|Installed package'
+    r'|Compiling|Downloading|Downloaded|Finished \`'
+    r'|Updating crates'
+    r'|\.\.\.ok\b'
+    r'|info: component'
+    r'|Cache not found for input keys'
+    r'|^$'
+)
+TS = re.compile(r'^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s*')
+ERROR = re.compile(
+    r'\berror[: ]|##\[error\]'
+    r'|FAILED|test result: FAILED'
+    r'|panic:|thread .+ panicked'
+    r'|unbound variable|command not found'
+    r'|No such file|Permission denied'
+    r'|cannot find|not found'
+    r'|: line \d+:|exit code [^0]'
+    r'|fatal:'
+)
+FINAL = re.compile(r'Job .+ (failed|succeeded)')
+
+STEP = re.compile(r'^\s*Run ')
+
+EMOJI = re.compile(u'[\U00010000-\U0010ffff]', flags=re.UNICODE)
+
+lines = sys.stdin.read().splitlines()
+cleaned = []
+for raw in lines:
+    line = TS.sub('', raw).rstrip()
+    line = EMOJI.sub('', line).strip()
+    if not line or NOISE.search(line):
+        continue
+    cleaned.append(line)
+
+max_out = int('${max_lines}')
+
+# Collect error lines and final result lines
+error_lines = [l for l in cleaned if ERROR.search(l)]
+final_lines = [l for l in cleaned if FINAL.search(l)]
+
+if error_lines:
+    # Find the step name that precedes the first error
+    first_err_idx = next((i for i, l in enumerate(cleaned) if ERROR.search(l)), None)
+    step_line = None
+    if first_err_idx is not None:
+        for i in range(first_err_idx - 1, -1, -1):
+            if STEP.search(cleaned[i]):
+                step_line = cleaned[i]
+                break
+    keep_final = min(len(final_lines), 1)
+    keep_err = max_out - keep_final - (1 if step_line else 0)
+    output = (([step_line] if step_line else []) + error_lines[:keep_err] + final_lines[:keep_final])
+else:
+    output = final_lines[:max_out] if final_lines else cleaned[-max_out:]
+
+# Deduplicate preserving order; truncate very long lines
+seen = set()
+for l in output:
+    if l not in seen:
+        seen.add(l)
+        # Truncate to 120 chars to avoid wrapping walls of rustc args
+        print(l[:120] + ('...' if len(l) > 120 else ''))
+" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------

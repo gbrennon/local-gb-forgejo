@@ -28,6 +28,20 @@ source "${SCRIPT_DIR}/lib/git-sync.sh"
 source "${SCRIPT_DIR}/lib/github-api.sh"
 
 # ---------------------------------------------------------------------------
+# PID lock — only one instance may run at a time.
+# Placing the lock file at the repo root keeps it visible alongside watcher.log.
+# ---------------------------------------------------------------------------
+WATCHER_PID_FILE="${SCRIPT_DIR}/../watcher.pid"
+if [[ -f "$WATCHER_PID_FILE" ]]; then
+  _existing_pid=$(cat "$WATCHER_PID_FILE")
+  if kill -0 "$_existing_pid" 2>/dev/null; then
+    echo "watch-mirrors.sh is already running (PID ${_existing_pid}). Exiting." >&2
+    exit 1
+  fi
+fi
+echo $$ > "$WATCHER_PID_FILE"
+
+# ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 INTERVAL=60
@@ -82,13 +96,13 @@ done
 # ---------------------------------------------------------------------------
 run_icon() {
   case "$1" in
-    success)   echo "✓" ;;
-    failure)   echo "✗" ;;
-    running)   echo "⟳" ;;
-    waiting)   echo "…" ;;
-    cancelled) echo "⊘" ;;
-    skipped)   echo "−" ;;
-    *)         echo "?" ;;
+    success)   echo "OK  " ;;
+    failure)   echo "FAIL" ;;
+    running)   echo "... " ;;
+    waiting)   echo "... " ;;
+    cancelled) echo "skip" ;;
+    skipped)   echo "-   " ;;
+    *)         echo "?   " ;;
   esac
 }
 
@@ -120,23 +134,28 @@ is_final_gh_state() {
 
 # ---------------------------------------------------------------------------
 # State file helpers
-# key format: "<sha>:<context>"
+# key format: "<sha>:<context>:<gh_state>"
+# Including the gh_state in the key means a status change (e.g. failure →
+# success after a re-run) will be re-posted to GitHub.
 # ---------------------------------------------------------------------------
-_state_has_done() {
-  grep -qF "$1:done" "$STATE_FILE" 2>/dev/null
+_state_has_key() {
+  grep -qF "$1" "$STATE_FILE" 2>/dev/null
 }
-_state_has_any() {
-  grep -qF "$1:" "$STATE_FILE" 2>/dev/null
-}
-_state_remove() {
+
+_state_remove_context() {
+  # Remove all entries for a given "sha:context" prefix regardless of state.
   if [[ -f "$STATE_FILE" ]]; then
     grep -vF "$1:" "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE" || true
   fi
 }
+
 _state_write() {
-  _state_remove "$1"
-  echo "$1:$2" >> "$STATE_FILE"
+  local context_key="$1"  # sha:context
+  local gh_state="$2"
+  _state_remove_context "$context_key"
+  echo "${context_key}:${gh_state}" >> "$STATE_FILE"
 }
+
 _state_prune() {
   # Keep only the last 1000 lines so the file never grows unbounded.
   if [[ -f "$STATE_FILE" ]] && [[ "$(wc -l < "$STATE_FILE")" -gt 1000 ]]; then
@@ -147,7 +166,8 @@ _state_prune() {
 # ---------------------------------------------------------------------------
 # report_runs_to_github <forgejo_owner/repo>
 # Reads recent Forgejo Actions runs and posts their status to GitHub.
-# Tracks reported statuses to avoid duplicate API calls.
+# Tracks reported statuses to avoid duplicate API calls. Re-posts if the
+# status changes (e.g. failure → success after a re-run).
 # Never propagates errors — failures are silently skipped so the watcher
 # loop stays alive regardless of GitHub API availability.
 # ---------------------------------------------------------------------------
@@ -161,39 +181,36 @@ report_runs_to_github() {
   if [[ -z "$github_slug" ]]; then return 0; fi
 
   local runs
-  runs=$(forgejo_list_recent_runs "$forgejo_repo" 10)
+  runs=$(forgejo_list_recent_runs "$forgejo_repo" 20)
   if [[ "$runs" == "no_runs" ]] || [[ -z "$runs" ]]; then return 0; fi
 
   _state_prune
 
   local posted=0
-  while IFS=$'\t' read -r status name branch sha run_url; do
+  while IFS=$'\t' read -r status name branch sha run_url _task_id; do
     if [[ -z "$sha" ]]; then continue; fi
 
     local gh_state
     gh_state=$(forgejo_to_github_state "$status")
     if [[ -z "$gh_state" ]]; then continue; fi
 
-    local key="${sha}:forgejo/${name}"
+    # Key includes the gh_state so a changed outcome (failure → success) re-posts.
+    local context_key="${sha}:forgejo/${name}"
+    local full_key="${context_key}:${gh_state}"
 
-    if is_final_gh_state "$status"; then
-      if _state_has_done "$key"; then continue; fi
-      if github_post_commit_status "$github_slug" "$sha" "$gh_state" \
-          "forgejo/${name}" "${name}: ${status}"; then
-        _state_write "$key" "done"
-        posted=$((posted + 1))
-      fi
-    else
-      if _state_has_any "$key"; then continue; fi
-      github_post_commit_status "$github_slug" "$sha" "pending" \
-        "forgejo/${name}" "${name}: ${status}" || true
-      _state_write "$key" "pending"
+    # Skip only if this exact (sha, context, state) combo was already posted.
+    if _state_has_key "$full_key"; then continue; fi
+
+    local description="${name}: ${status}"
+    if github_post_commit_status "$github_slug" "$sha" "$gh_state" \
+        "forgejo/${name}" "$description"; then
+      _state_write "$context_key" "$gh_state"
       posted=$((posted + 1))
     fi
   done <<< "$runs"
 
   if [[ $posted -gt 0 ]]; then
-    printf '         → %d GitHub status(es) posted (%s)\n' "$posted" "$github_slug"
+    printf '         -> %d GitHub status(es) posted (%s)\n' "$posted" "$github_slug"
   fi
 }
 
@@ -208,19 +225,30 @@ print_run_status() {
   runs=$(forgejo_list_recent_runs "$repo" 5)
 
   if [[ "$runs" == "no_runs" ]] || [[ -z "$runs" ]]; then
-    printf '         ·  no action runs yet\n'
+    printf '         .  no action runs yet\n'
     return
   fi
 
-  while IFS=$'\t' read -r status name branch sha run_url; do
+  while IFS=$'\t' read -r status name branch sha run_url task_id; do
     local icon short_sha
     icon=$(run_icon "$status")
     short_sha="${sha:0:7}"
     # Prefix with [CI] to make clear this is a Forgejo Actions job result, not a script error
     printf '         [CI] %s  %-10s  %-30s  %s @ %s\n' "$icon" "$status" "$name" "$short_sha" "$branch"
 
-    if [[ "$status" == "failure" || "$status" == "error" ]] && [[ -n "$run_url" ]]; then
-      printf '               └─ logs: %s\n' "$run_url"
+    if [[ "$status" == "failure" || "$status" == "error" ]]; then
+      if [[ -n "$task_id" ]]; then
+        local log_tail
+        log_tail=$(forgejo_get_task_log_tail "$repo" "$task_id" 6 2>/dev/null || true)
+        if [[ -n "$log_tail" ]]; then
+          while IFS= read -r log_line; do
+            printf '               |  %s\n' "$log_line"
+          done <<< "$log_tail"
+        fi
+      fi
+      if [[ -n "$run_url" ]]; then
+        printf '               \\- logs: %s\n' "$run_url"
+      fi
     fi
   done <<< "$runs"
 }
@@ -265,9 +293,9 @@ sync_cycle() {
   [[ -n "$push_repos" ]] && push_count=$(echo "$push_repos" | grep -c .) || push_count=0
 
   echo ""
-  echo "────────────────────────────────────────────────────────"
+  echo "--------------------------------------------------------"
   echo "  ${timestamp}  |  Cycle #${cycle}  |  ${#all_repos[@]} repo(s)"
-  echo "────────────────────────────────────────────────────────"
+  echo "--------------------------------------------------------"
 
   local failed=()
   declare -A fail_msgs=()
@@ -276,7 +304,7 @@ sync_cycle() {
     # never trigger. Auto-convert in place: delete the mirror and recreate as a
     # regular repo under the same owner, then push from GitHub.
     if echo "$mirror_repos" | grep -qx "$repo"; then
-      printf '    [..] %-32s pull mirror detected — auto-converting to push repo\n' "$repo"
+      printf '    [..] %-32s pull mirror detected - auto-converting to push repo\n' "$repo"
       local conv_slug
       conv_slug=$(forgejo_convert_mirror_to_push "$repo" 2>&1) || {
         printf '    [!!] %-32s conversion failed: %s\n' "$repo" "$conv_slug" >&2
@@ -284,7 +312,7 @@ sync_cycle() {
         fail_msgs["$repo"]="$conv_slug"
         continue
       }
-      printf '    [OK] %-32s converted — pushing from github.com/%s\n' "$repo" "$conv_slug"
+      printf '    [OK] %-32s converted - pushing from github.com/%s\n' "$repo" "$conv_slug"
       local push_out
       push_out=$(git_init_push "$repo" "$conv_slug" 2>&1) || {
         printf '    [!!] %-32s initial push failed: %s\n' "$repo" "$push_out" >&2
@@ -292,7 +320,7 @@ sync_cycle() {
         fail_msgs["$repo"]="$push_out"
         continue
       }
-      printf '    [OK] %-32s push complete — waiting for Actions to queue\n' "$repo"
+      printf '    [OK] %-32s push complete - waiting for Actions to queue\n' "$repo"
       sleep 4
       print_run_status "$repo"
       report_runs_to_github "$repo" || true
@@ -304,20 +332,21 @@ sync_cycle() {
     local source_label="${github_slug:-unknown}"
 
     sync_info=$(git_push_sync "$repo" 2>&1) || {
-      printf '    [!!] %-32s sync failed  ←  %s\n' "$repo" "$source_label" >&2
+      printf '    [!!] %-32s sync failed  <-  %s\n' "$repo" "$source_label" >&2
       fail_msgs["$repo"]="$sync_info"
       failed+=("$repo")
       continue
     }
 
-    printf '    [OK] %-32s %s  ←  %s\n' "$repo" "$sync_info" "$source_label"
+    printf '    [OK] %-32s %s  <-  %s\n' "$repo" "$sync_info" "$source_label"
+
     runs=$(forgejo_list_recent_runs "$repo" 5)
     if [[ "$runs" == "no_runs" || -z "$runs" ]]; then
       sleep 3
       runs=$(forgejo_list_recent_runs "$repo" 5)
     fi
     if [[ "$runs" == "no_runs" || -z "$runs" ]]; then
-      printf '         ·  no action runs yet — check that workflow files exist in .forgejo/workflows/ or .github/workflows/\n'
+      printf '         .  no action runs yet - check that workflow files exist in .forgejo/workflows/ or .github/workflows/\n'
     else
       print_run_status "$repo"
       report_runs_to_github "$repo" || true
@@ -337,6 +366,7 @@ sync_cycle() {
 # Shutdown handler
 # ---------------------------------------------------------------------------
 on_exit() {
+  rm -f "$WATCHER_PID_FILE"
   echo ""
   echo "==> Watcher stopped."
   echo "    Run ./scripts/watch-mirrors.sh to restart the daemon."
@@ -377,6 +407,6 @@ while true; do
     break
   fi
 
-  printf '\n  ⏳ next sync in %ds\n' "$INTERVAL"
+  printf '\n  next sync in %ds\n' "$INTERVAL"
   sleep "$INTERVAL"
 done

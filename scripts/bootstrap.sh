@@ -395,8 +395,8 @@ validate_container() {
 # ---------------------------------------------------------------------------
 start_watcher() {
   local repo_root
-  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local watcher="${repo_root}/watch-mirrors.sh"
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  local watcher="${repo_root}/scripts/watch-mirrors.sh"
   local pid_file="${repo_root}/watcher.pid"
   local log_file="${repo_root}/watcher.log"
 
@@ -405,14 +405,14 @@ start_watcher() {
     return
   fi
 
-  # Stop any previously running watcher
+  # Stop any previously running watcher using the PID file.
   if [[ -f "$pid_file" ]]; then
     local old_pid
     old_pid=$(cat "$pid_file")
     if kill -0 "$old_pid" 2>/dev/null; then
       info "Stopping existing watcher (PID ${old_pid})..."
       kill "$old_pid" 2>/dev/null || true
-      sleep 1
+      sleep 2
     fi
     rm -f "$pid_file"
   fi
