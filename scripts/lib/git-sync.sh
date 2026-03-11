@@ -13,17 +13,79 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 GIT_CACHE_DIR="${REPO_ROOT}/runner-data/git-cache"
 
 # ---------------------------------------------------------------------------
+# _forgejo_user_push_token <username>
+# Returns a PAT for <username> suitable for git push authentication.
+# Tokens are cached in FORGEJO_TOKEN_CACHE_DIR and reused across cycles.
+# On first use (or cache miss) a new token is created via the admin API.
+# ---------------------------------------------------------------------------
+_FORGEJO_TOKEN_CACHE_DIR="${REPO_ROOT}/runner-data/push-tokens"
+
+_forgejo_user_push_token() {
+  local username="$1"
+  local cache_file="${_FORGEJO_TOKEN_CACHE_DIR}/${username}"
+
+  mkdir -p "$_FORGEJO_TOKEN_CACHE_DIR"
+  chmod 700 "$_FORGEJO_TOKEN_CACHE_DIR"
+
+  if [[ -f "$cache_file" ]]; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  # Delete any stale token with this name before creating a fresh one.
+  local existing_id
+  existing_id=$(curl -sf \
+    -u "${AUTH}" \
+    "${FORGEJO_HOST}/api/v1/users/${username}/tokens" \
+    | python3 -c "
+import sys,json
+for t in json.load(sys.stdin):
+    if t.get('name') == 'watcher-push':
+        print(t['id']); break
+" 2>/dev/null || true)
+  if [[ -n "$existing_id" ]]; then
+    curl -sf -X DELETE \
+      -u "${AUTH}" \
+      "${FORGEJO_HOST}/api/v1/users/${username}/tokens/${existing_id}" \
+      >/dev/null 2>&1 || true
+  fi
+
+  local token
+  token=$(curl -sf -X POST \
+    -u "${AUTH}" \
+    -H "Content-Type: application/json" \
+    "${FORGEJO_HOST}/api/v1/users/${username}/tokens" \
+    -d '{"name":"watcher-push","scopes":["write:repository"]}' \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['sha1'])" 2>/dev/null || true)
+
+  if [[ -z "$token" ]]; then
+    # Fall back to admin credentials if token creation fails.
+    echo "$FORGEJO_ADMIN_PASSWORD"
+    return 0
+  fi
+
+  echo "$token" > "$cache_file"
+  chmod 600 "$cache_file"
+  echo "$token"
+}
+
+# ---------------------------------------------------------------------------
 # _forgejo_git_url <owner/repo>
 # Returns the authenticated Forgejo HTTP git URL for pushing.
-# Credentials are URL-encoded so special characters in passwords (# @ $ etc.)
-# do not break the URL parser.
+# Uses a PAT belonging to the repo owner so pushes are attributed correctly.
+# Credentials are URL-encoded so special characters do not break the URL.
 # ---------------------------------------------------------------------------
 _forgejo_git_url() {
   local owner_repo="$1"
-  local user pass
-  user=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$FORGEJO_ADMIN_USER")
-  pass=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$FORGEJO_ADMIN_PASSWORD")
-  echo "${FORGEJO_HOST/http:\/\//http://${user}:${pass}@}/${owner_repo}.git"
+  local owner="${owner_repo%%/*}"
+
+  local token
+  token=$(_forgejo_user_push_token "$owner")
+
+  local user_enc token_enc
+  user_enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$owner")
+  token_enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$token")
+  echo "${FORGEJO_HOST/http:\/\//http://${user_enc}:${token_enc}@}/${owner_repo}.git"
 }
 
 # ---------------------------------------------------------------------------
@@ -66,12 +128,19 @@ git_push_sync() {
 
   if [[ ! -d "$cache_dir" ]]; then
     git clone --bare --quiet "$github_url" "$cache_dir"
+    # Ensure origin maps all remote branches into local refs/heads/* so that
+    # git push --all sends every branch to Forgejo.
+    git -C "$cache_dir" config remote.origin.fetch '+refs/heads/*:refs/heads/*'
     git -C "$cache_dir" remote add forgejo "$forgejo_url"
   else
     git -C "$cache_dir" remote set-url origin "$github_url" 2>/dev/null || true
+    # Ensure fetch refspec is correct — bare clones can lose it if the remote
+    # was re-added or manipulated. Without this, fetch only updates FETCH_HEAD
+    # and refs/heads/* stay stale, causing "all branches up to date" false positives.
+    git -C "$cache_dir" config remote.origin.fetch '+refs/heads/*:refs/heads/*'
     git -C "$cache_dir" remote set-url forgejo "$forgejo_url" 2>/dev/null || \
-      git -C "$cache_dir" remote add forgejo "$forgejo_url"
-    git -C "$cache_dir" fetch --all --prune --quiet
+      git -C "$cache_dir" remote add forgejo "$forgejo_url" 2>/dev/null || true
+    git -C "$cache_dir" fetch origin --prune --quiet
   fi
 
   local push_out
@@ -126,13 +195,15 @@ git_init_push() {
   if [[ ! -d "$cache_dir" ]]; then
     info "Cloning from GitHub (may take a moment for large repos)..."
     git clone --bare --quiet "$github_url" "$cache_dir"
+    git -C "$cache_dir" config remote.origin.fetch '+refs/heads/*:refs/heads/*'
     git -C "$cache_dir" remote add forgejo "$forgejo_url"
   else
     info "Updating local git cache..."
     git -C "$cache_dir" remote set-url origin "$github_url" 2>/dev/null || true
+    git -C "$cache_dir" config remote.origin.fetch '+refs/heads/*:refs/heads/*'
     git -C "$cache_dir" remote set-url forgejo "$forgejo_url" 2>/dev/null || \
-      git -C "$cache_dir" remote add forgejo "$forgejo_url"
-    git -C "$cache_dir" fetch --all --prune --quiet
+      git -C "$cache_dir" remote add forgejo "$forgejo_url" 2>/dev/null || true
+    git -C "$cache_dir" fetch origin --prune --quiet
   fi
 
   # Retry initial push to handle transient network/service restarts
