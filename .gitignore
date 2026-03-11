@@ -7,3 +7,4 @@ watcher.log
 
 # Local git cache for push-based mirror sync
 runner-data/git-cache/
+bin/
