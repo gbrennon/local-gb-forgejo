@@ -338,6 +338,102 @@ start_runner() {
 }
 
 # ---------------------------------------------------------------------------
+# update_env_token <key> <token>
+# Adds or updates a token in .env file
+# ---------------------------------------------------------------------------
+update_env_token() {
+  local key="$1"
+  local token="$2"
+  local env_file=".env"
+
+  if grep -q "^${key}=" "$env_file"; then
+    sed -i "s|^${key}=.*|${key}=${token}|" "$env_file"
+  else
+    echo "${key}=${token}" >> "$env_file"
+  fi
+  info "Updated ${key} in .env"
+}
+
+# ---------------------------------------------------------------------------
+# bootstrap_additional_runners
+# Fetches tokens and starts tiny, small, medium runners
+# ---------------------------------------------------------------------------
+bootstrap_additional_runners() {
+  local runners=("tiny" "small" "medium")
+  local names=("runner-tiny" "runner-small" "runner-medium")
+  local volumes=("forgejo_runner_tiny" "forgejo_runner_small" "forgejo_runner_medium")
+  local compose_network="${COMPOSE_PROJECT_NAME}_default"
+
+  info "Bootstrapping additional runners..."
+
+  for i in "${!runners[@]}"; do
+    local runner="${runners[$i]}"
+    local name="${names[$i]}"
+    local volume="${volumes[$i]}"
+    local volume_full="${COMPOSE_PROJECT_NAME}_${volume}"
+    local env_key="RUNNER_TOKEN_${runner^^}"
+    local state_file="/data/.runner"
+
+    local token
+    token=$(fetch_registration_token)
+    update_env_token "$env_key" "$token"
+
+    local existing_runner
+    existing_runner=$(
+      $CONTAINER_RUNTIME run --rm \
+        -v "${volume_full}:/data" \
+        busybox \
+        test -f "$state_file" 2>/dev/null && echo "yes" || echo "no"
+    )
+
+    if [[ "$existing_runner" == "yes" ]]; then
+      info "${name} already registered, skipping config."
+    else
+      info "Registering ${name}..."
+      $CONTAINER_RUNTIME run --rm \
+        -v "${volume_full}:/data" \
+        -w /data \
+        --user 0:0 \
+        --network "$compose_network" \
+        "$RUNNER_IMAGE" \
+        sh -c "forgejo-runner generate-config > /data/config.yml && \
+          forgejo-runner register \
+            -c /data/config.yml \
+            --no-interactive \
+            --instance 'http://forgejo:3000' \
+            --name ${name} \
+            --token '${token}' \
+            --labels codeberg-${runner}"
+
+      $CONTAINER_RUNTIME run --rm \
+        -v "${volume_full}:/data" \
+        busybox \
+        sed -i "s|^  network: \"\"$|  network: \"${compose_network}\"|" /data/config.yml
+    fi
+  done
+
+  info "Starting additional runners..."
+  compose_up runner-tiny runner-small runner-medium
+
+  for name in "${names[@]}"; do
+    info "Waiting for ${name} to connect..."
+    local retries=20
+    local i=0
+    until $CONTAINER_RUNTIME logs "$name" 2>&1 | grep -q "declared successfully"; do
+      sleep 3
+      i=$((i + 1))
+      if [[ $i -ge $retries ]]; then
+        warn "${name} did not connect within expected time."
+        break
+      fi
+    done
+    if [[ $i -lt $retries ]]; then
+      info "${name} connected."
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
 # wait_for_runner
 # Polls until the runner logs show it has declared itself to Forgejo.
 # ---------------------------------------------------------------------------
@@ -446,6 +542,7 @@ main() {
   start_runner
   wait_for_runner
   validate_container
+  bootstrap_additional_runners
 
   if [[ "$skip_watcher" == false ]]; then
     start_watcher

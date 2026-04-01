@@ -55,6 +55,11 @@ services:
     user: 0:0
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
+    environment:
+      - GITEA_INSTANCE_URL=http://forgejo:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN_FILE=/run/secrets/runner_token
+      - GITEA_RUNNER_NAME=local-runner
+      - GITEA_RUNNER_LABELS=ubuntu-latest,linux/amd64
     volumes:
       - forgejo_runner_data:/data
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
@@ -63,8 +68,100 @@ services:
     depends_on:
       forgejo:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+    secrets:
+      - runner_token
+
+  runner-tiny:
+    image: data.forgejo.org/forgejo/runner:9
+    container_name: forgejo-runner-tiny
+    restart: unless-stopped
+    user: 0:0
+    working_dir: /data
+    command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
+    environment:
+      - GITEA_INSTANCE_URL=http://forgejo:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_TINY}
+      - GITEA_RUNNER_NAME=runner-tiny
+      - GITEA_RUNNER_LABELS=codeberg-tiny
+    volumes:
+      - forgejo_runner_tiny:/data
+      - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
+    security_opt:
+      - label=disable
+    depends_on:
+      forgejo:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  runner-small:
+    image: data.forgejo.org/forgejo/runner:9
+    container_name: forgejo-runner-small
+    restart: unless-stopped
+    user: 0:0
+    working_dir: /data
+    command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
+    environment:
+      - GITEA_INSTANCE_URL=http://forgejo:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_SMALL}
+      - GITEA_RUNNER_NAME=runner-small
+      - GITEA_RUNNER_LABELS=codeberg-small
+    volumes:
+      - forgejo_runner_small:/data
+      - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
+    security_opt:
+      - label=disable
+    depends_on:
+      forgejo:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+
+  runner-medium:
+    image: data.forgejo.org/forgejo/runner:9
+    container_name: forgejo-runner-medium
+    restart: unless-stopped
+    user: 0:0
+    working_dir: /data
+    command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
+    environment:
+      - GITEA_INSTANCE_URL=http://forgejo:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_MEDIUM}
+      - GITEA_RUNNER_NAME=runner-medium
+      - GITEA_RUNNER_LABELS=codeberg-medium
+    volumes:
+      - forgejo_runner_medium:/data
+      - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
+    security_opt:
+      - label=disable
+    depends_on:
+      forgejo:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
 
 volumes:
   forgejo_data:
   forgejo_db_data:
   forgejo_runner_data:
+  forgejo_runner_tiny:
+  forgejo_runner_small:
+  forgejo_runner_medium:
+
+secrets:
+  runner_token:
+    file: ./forgejo_secret.txt
