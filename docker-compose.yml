@@ -5,8 +5,6 @@ services:
     restart: unless-stopped
     ports:
       - "1234:3000"
-      # Port 443 requires root. Use 8443 or iptables redirect if needed:
-      # - "443:3000"
     volumes:
       - forgejo_data:/data
       - /etc/localtime:/etc/localtime:ro
@@ -58,10 +56,10 @@ services:
       start_period: 10s
 
   forgejo-runner:
-    image: data.forgejo.org/forgejo/runner:9
+    image: code.forgejo.org/forgejo/runner:9
     container_name: forgejo-runner
     restart: unless-stopped
-    user: 0:0
+    user: "0:0"
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
@@ -69,12 +67,14 @@ services:
       - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN_FILE=/run/secrets/runner_token
       - GITEA_RUNNER_NAME=local-runner
-      - GITEA_RUNNER_LABELS=ubuntu-latest,linux/amd64
+      - GITEA_RUNNER_LABELS=ubuntu-latest:docker://node:20-bookworm,ubuntu-22.04:docker://node:20-bookworm,debian-latest:docker://debian:bookworm
     volumes:
       - forgejo_runner_data:/data
+      - ./runner-data/config.yml:/data/config.yml:ro,z
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
     security_opt:
       - label=disable
+    priviled: true
     depends_on:
       forgejo:
         condition: service_healthy
@@ -87,10 +87,10 @@ services:
       - runner_token
 
   runner-tiny:
-    image: data.forgejo.org/forgejo/runner:9
+    image: code.forgejo.org/forgejo/runner:9
     container_name: forgejo-runner-tiny
     restart: unless-stopped
-    user: 0:0
+    user: "0:0"
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
@@ -98,9 +98,10 @@ services:
       - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_TINY}
       - GITEA_RUNNER_NAME=runner-tiny
-      - GITEA_RUNNER_LABELS=codeberg-tiny
+      - GITEA_RUNNER_LABELS=codeberg-tiny:docker://node:20-bookworm
     volumes:
       - forgejo_runner_tiny:/data
+      - ./runner-data/config.yml:/data/config.yml:ro,z
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
     security_opt:
       - label=disable
@@ -114,10 +115,10 @@ services:
           memory: 512M
 
   runner-small:
-    image: data.forgejo.org/forgejo/runner:9
+    image: code.forgejo.org/forgejo/runner:9
     container_name: forgejo-runner-small
     restart: unless-stopped
-    user: 0:0
+    user: "0:0"
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
@@ -125,9 +126,10 @@ services:
       - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_SMALL}
       - GITEA_RUNNER_NAME=runner-small
-      - GITEA_RUNNER_LABELS=codeberg-small
+      - GITEA_RUNNER_LABELS=codeberg-small:docker://node:20-bookworm
     volumes:
       - forgejo_runner_small:/data
+      - ./runner-data/config.yml:/data/config.yml:ro,z
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
     security_opt:
       - label=disable
@@ -141,10 +143,10 @@ services:
           memory: 1G
 
   runner-medium:
-    image: data.forgejo.org/forgejo/runner:9
+    image: code.forgejo.org/forgejo/runner:9
     container_name: forgejo-runner-medium
     restart: unless-stopped
-    user: 0:0
+    user: "0:0"
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
@@ -152,9 +154,10 @@ services:
       - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_MEDIUM}
       - GITEA_RUNNER_NAME=runner-medium
-      - GITEA_RUNNER_LABELS=codeberg-medium
+      - GITEA_RUNNER_LABELS=codeberg-medium:docker://node:20-bookworm
     volumes:
       - forgejo_runner_medium:/data
+      - ./runner-data/config.yml:/data/config.yml:ro,z
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
     security_opt:
       - label=disable
