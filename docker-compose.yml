@@ -1,13 +1,16 @@
 services:
   forgejo:
-    image: codeberg.org/forgejo/forgejo:11
+    image: codeberg.org/forgejo/forgejo:15
     container_name: forgejo
     restart: unless-stopped
     ports:
       - "1234:3000"
+      # Port 443 requires root. Use 8443 or iptables redirect if needed:
+      # - "443:3000"
     volumes:
       - forgejo_data:/data
       - /etc/localtime:/etc/localtime:ro
+      - ./certs:/certs:Z,ro
     environment:
       - USER_UID=1000
       - USER_GID=1000
@@ -19,13 +22,19 @@ services:
       - FORGEJO__actions__ENABLED=true
       - FORGEJO__actions__RUNNER_MODE=docker
       - FORGEJO__security__INSTALL_LOCK=true
-      - FORGEJO__server__ROOT_URL=http://forgejo.local/
-      - FORGEJO__server__DOMAIN=localhost
+      - FORGEJO__server__ROOT_URL=https://forgejo.local/
+      - FORGEJO__server__DOMAIN=forgejo.local
+      - FORGEJO__server__PROTOCOL=https
+      - FORGEJO__server__CERT_FILE=/certs/server-cert.pem
+      - FORGEJO__server__KEY_FILE=/certs/server-key.pem
+      - FORGEJO__server__SSH_PORT=2222
+      - FORGEJO__server__SSH_LISTEN_PORT=22
+      - FORGEJO__repository__ALLOW_SELF_REVIEWS=true
     depends_on:
       forgejo-db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      test: ["CMD", "curl", "-fk", "https://localhost:3000"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -56,7 +65,8 @@ services:
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
-      - GITEA_INSTANCE_URL=http://forgejo:3000
+      - GITEA_INSTANCE_URL=https://forgejo:3000
+      - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN_FILE=/run/secrets/runner_token
       - GITEA_RUNNER_NAME=local-runner
       - GITEA_RUNNER_LABELS=ubuntu-latest,linux/amd64
@@ -84,7 +94,8 @@ services:
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
-      - GITEA_INSTANCE_URL=http://forgejo:3000
+      - GITEA_INSTANCE_URL=https://forgejo:3000
+      - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_TINY}
       - GITEA_RUNNER_NAME=runner-tiny
       - GITEA_RUNNER_LABELS=codeberg-tiny
@@ -110,7 +121,8 @@ services:
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
-      - GITEA_INSTANCE_URL=http://forgejo:3000
+      - GITEA_INSTANCE_URL=https://forgejo:3000
+      - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_SMALL}
       - GITEA_RUNNER_NAME=runner-small
       - GITEA_RUNNER_LABELS=codeberg-small
@@ -136,7 +148,8 @@ services:
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
-      - GITEA_INSTANCE_URL=http://forgejo:3000
+      - GITEA_INSTANCE_URL=https://forgejo:3000
+      - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_MEDIUM}
       - GITEA_RUNNER_NAME=runner-medium
       - GITEA_RUNNER_LABELS=codeberg-medium
