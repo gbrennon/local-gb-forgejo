@@ -96,7 +96,9 @@ _forgejo_git_url() {
   local user_enc token_enc
   user_enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$owner")
   token_enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$token")
-  echo "${FORGEJO_HOST/http:\/\//http://${user_enc}:${token_enc}@}/${owner_repo}.git"
+  # Strip existing protocol prefix and rebuild with embedded credentials
+  local scheme="${FORGEJO_HOST%%://*}"
+  echo "${scheme}://${user_enc}:${token_enc}@${FORGEJO_HOST#*://}/${owner_repo}.git"
 }
 
 # ---------------------------------------------------------------------------

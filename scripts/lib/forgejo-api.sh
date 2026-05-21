@@ -160,6 +160,33 @@ forgejo_create_push_repo() {
 }
 
 # ---------------------------------------------------------------------------
+# forgejo_list_all_repos
+# Prints "owner/repo" for every repo in Forgejo, regardless of mirror status
+# or website field. This catches repos created via CLI, Web UI, or API.
+# ---------------------------------------------------------------------------
+forgejo_list_all_repos() {
+  local page=1
+  while true; do
+    local page_output
+    page_output=$(curl -sf \
+      -u "${AUTH}" \
+      "${FORGEJO_HOST}/api/v1/repos/search?limit=50&page=${page}" \
+      | python3 -c "
+import sys, json
+result = json.load(sys.stdin)
+repos = result.get('data', [])
+for r in repos:
+    print(r['full_name'])
+print('__END__' if len(repos) < 50 else '__MORE__')
+" 2>/dev/null || true)
+
+    echo "$page_output" | grep -v '__END__\|__MORE__' || true
+    echo "$page_output" | grep -q '__END__' && break
+    page=$((page + 1))
+  done
+}
+
+# ---------------------------------------------------------------------------
 # forgejo_list_push_repos
 # Prints "owner/repo" for every repo whose website field contains github.com.
 # These are repos managed by the push-sync workflow (not Forgejo pull mirrors).
