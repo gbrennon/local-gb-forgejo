@@ -89,6 +89,7 @@ detect_runtime() {
 
   # For runner registration: podman-compose run is outside the pod network,
   # so we reach Forgejo via the host. Docker shares the compose network.
+  # Protocol matches FORGEJO__server__PROTOCOL (set to http in docker-compose.yml).
   if [[ "$CONTAINER_RUNTIME" == "podman" ]]; then
     FORGEJO_INTERNAL_URL="http://host.containers.internal:${FORGEJO_HOST_PORT}"
   else
@@ -119,16 +120,14 @@ kill_port() {
 
 # ---------------------------------------------------------------------------
 # compose_up [service ...]
-# Wrapper: podman-compose creates pods — 'down' tears down the pod cleanly.
-# docker compose up -d is idempotent natively.
+# Starts services via the detected compose tool. Both podman-compose and
+# docker compose support idempotent "up" — running it on already-running
+# services is a no-op. The previous podman path did a "down" first which
+# destroyed the pod and re-created it on every call, forcing Forgejo to
+# restart from scratch and causing bootstrap to time out.
 # ---------------------------------------------------------------------------
 compose_up() {
-  if [[ "$CONTAINER_RUNTIME" == "podman" ]]; then
-    $COMPOSE down 2>/dev/null || true
-    $COMPOSE up --detach "$@"
-  else
-    $COMPOSE up -d "$@"
-  fi
+  $COMPOSE up --detach "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -158,7 +157,7 @@ wait_for_forgejo() {
   info "Waiting for Forgejo API to be ready..."
   local retries=20
   local i=0
-  until curl -sf "${FORGEJO_HOST_URL}/api/v1/version" >/dev/null 2>&1; do
+  until curl -sfk "${FORGEJO_HOST_URL}/api/v1/version" >/dev/null 2>&1; do
     sleep 3
     i=$((i + 1))
     if [[ $i -ge $retries ]]; then
@@ -225,7 +224,7 @@ fetch_registration_token() {
   local tmpfile
   tmpfile=$(mktemp)
   local http_code
-  http_code=$(curl -s \
+  http_code=$(curl -sk \
     -o "$tmpfile" \
     -w "%{http_code}" \
     -u "${FORGEJO_ADMIN_USER}:${FORGEJO_ADMIN_PASSWORD}" \
@@ -338,6 +337,107 @@ start_runner() {
 }
 
 # ---------------------------------------------------------------------------
+# update_env_token <key> <token>
+# Adds or updates a token in .env file
+# ---------------------------------------------------------------------------
+update_env_token() {
+  local key="$1"
+  local token="$2"
+  local env_file=".env"
+
+  if grep -q "^${key}=" "$env_file"; then
+    sed -i "s|^${key}=.*|${key}=${token}|" "$env_file"
+  else
+    echo "${key}=${token}" >> "$env_file"
+  fi
+  info "Updated ${key} in .env"
+}
+
+# ---------------------------------------------------------------------------
+# bootstrap_additional_runners
+# Fetches tokens and starts tiny, small, medium runners
+# ---------------------------------------------------------------------------
+bootstrap_additional_runners() {
+  local runners=("tiny" "small" "medium")
+  local names=("runner-tiny" "runner-small" "runner-medium")
+  local volumes=("forgejo_runner_tiny" "forgejo_runner_small" "forgejo_runner_medium")
+  local compose_network="${COMPOSE_PROJECT_NAME}_default"
+
+  info "Bootstrapping additional runners..."
+
+  # Fetch a single registration token — Forgejo tokens can be reused for
+  # multiple runners, and rapid successive API calls may return the same token.
+  local shared_token
+  shared_token=$(fetch_registration_token)
+  info "Fetched shared registration token for additional runners"
+
+  for i in "${!runners[@]}"; do
+    local runner="${runners[$i]}"
+    local name="${names[$i]}"
+    local volume="${volumes[$i]}"
+    local volume_full="${COMPOSE_PROJECT_NAME}_${volume}"
+    local env_key="RUNNER_TOKEN_${runner^^}"
+    local state_file="/data/.runner"
+
+    # Persist token (shared across all additional runners)
+    update_env_token "$env_key" "$shared_token"
+
+    local existing_runner
+    existing_runner=$(
+      $CONTAINER_RUNTIME run --rm \
+        -v "${volume_full}:/data" \
+        busybox \
+        test -f "$state_file" 2>/dev/null && echo "yes" || echo "no"
+    )
+
+    if [[ "$existing_runner" == "yes" ]]; then
+      info "${name} already registered, skipping config."
+    else
+      info "Registering ${name}..."
+      $CONTAINER_RUNTIME run --rm \
+        -v "${volume_full}:/data" \
+        -w /data \
+        --user 0:0 \
+        --network "$compose_network" \
+        "$RUNNER_IMAGE" \
+        sh -c "forgejo-runner generate-config > /data/config.yml && \
+          forgejo-runner register \
+            -c /data/config.yml \
+            --no-interactive \
+            --instance 'http://forgejo:3000' \
+            --name ${name} \
+            --token '${shared_token}' \
+            --labels codeberg-${runner}"
+
+      $CONTAINER_RUNTIME run --rm \
+        -v "${volume_full}:/data" \
+        busybox \
+        sed -i "s|^  network: \"\"$|  network: \"${compose_network}\"|" /data/config.yml
+    fi
+  done
+
+  info "Starting additional runners..."
+  compose_up runner-tiny runner-small runner-medium
+
+  for name in "${names[@]}"; do
+    info "Waiting for ${name} to connect..."
+    local retries=20
+    local i=0
+    until $CONTAINER_RUNTIME logs "$name" 2>&1 | grep -q "declared successfully"; do
+      sleep 3
+      i=$((i + 1))
+      if [[ $i -ge $retries ]]; then
+        warn "${name} did not connect within expected time."
+        break
+      fi
+    done
+    if [[ $i -lt $retries ]]; then
+      info "${name} connected."
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
 # wait_for_runner
 # Polls until the runner logs show it has declared itself to Forgejo.
 # ---------------------------------------------------------------------------
@@ -389,41 +489,28 @@ validate_container() {
 
 
 # ---------------------------------------------------------------------------
-# start_watcher
-# Launches watch-mirrors.sh as a persistent background host process.
-# Idempotent: stops any existing watcher before starting a fresh one.
+# start_autostart
+# Runs all autostart scripts in priority order.
+# Idempotent: each script handles its own PID file.
 # ---------------------------------------------------------------------------
-start_watcher() {
+start_autostart() {
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  local watcher="${repo_root}/scripts/watch-mirrors.sh"
-  local pid_file="${repo_root}/watcher.pid"
-  local log_file="${repo_root}/watcher.log"
+  local autostart_script="${repo_root}/scripts/autostart/autostart.sh"
 
-  if [[ ! -f "$watcher" ]]; then
-    warn "watch-mirrors.sh not found at ${watcher} — skipping watcher start."
+  if [[ ! -f "$autostart_script" ]]; then
+    warn "autostart.sh not found at ${autostart_script} — skipping autostart."
     return
   fi
 
-  # Stop any previously running watcher using the PID file.
-  if [[ -f "$pid_file" ]]; then
-    local old_pid
-    old_pid=$(cat "$pid_file")
-    if kill -0 "$old_pid" 2>/dev/null; then
-      info "Stopping existing watcher (PID ${old_pid})..."
-      kill "$old_pid" 2>/dev/null || true
-      sleep 2
-    fi
-    rm -f "$pid_file"
+  info "Running autostart scripts..."
+  if bash "$autostart_script"; then
+    ok "Autostart scripts started"
+    return
   fi
 
-  info "Starting mirror watcher in background..."
-  nohup bash "$watcher" >> "$log_file" 2>&1 &
-  local watcher_pid=$!
-  echo "$watcher_pid" > "$pid_file"
-  ok "Mirror watcher started (PID ${watcher_pid})"
-  info "  Logs: tail -f ${log_file}"
-  info "  Stop: kill \$(cat watcher.pid)"
+  warn "Autostart had errors — check logs:"
+  info "  Logs: tail -f watcher.log watch-prs.log"
 }
 
 # ---------------------------------------------------------------------------
@@ -446,11 +533,12 @@ main() {
   start_runner
   wait_for_runner
   validate_container
+  bootstrap_additional_runners
 
   if [[ "$skip_watcher" == false ]]; then
-    start_watcher
+    start_autostart
   else
-    info "Skipping watcher start (--no-watcher). Managed externally (e.g. systemd)."
+    info "Skipping autostart (--no-watcher). Managed externally (e.g. systemd)."
   fi
 }
 

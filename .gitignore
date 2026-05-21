@@ -10,3 +10,7 @@ watcher.log
 runner-data/git-cache/
 runner-data/push-tokens/
 bin/
+
+# SSL private keys - never commit
+certs/*-key.pem
+certs/*.srl

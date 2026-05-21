@@ -5,7 +5,10 @@
 # Resolve the repository root (two levels up from scripts/lib/)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-FORGEJO_HOST="${FORGEJO_HOST:-http://localhost:1234}"
+FORGEJO_HOST="${FORGEJO_HOST:-https://localhost:1234}"
+
+# Trust our self-signed CA so all curl calls in scripts Just Work
+export CURL_CA_BUNDLE="${REPO_ROOT}/certs/ca-cert.pem"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -42,7 +45,7 @@ load_env() {
 # Exits with a clear message if Forgejo is not reachable.
 # ---------------------------------------------------------------------------
 require_forgejo() {
-  curl -sf "${FORGEJO_HOST}" >/dev/null \
+  curl -sfk "${FORGEJO_HOST}" >/dev/null \
     || die "Forgejo is not responding at ${FORGEJO_HOST}. Run ./bootstrap.sh first."
   ok "Forgejo is reachable at ${FORGEJO_HOST}"
 }
