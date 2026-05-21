@@ -22,9 +22,7 @@ services:
       - FORGEJO__security__INSTALL_LOCK=true
       - FORGEJO__server__ROOT_URL=https://forgejo.local/
       - FORGEJO__server__DOMAIN=forgejo.local
-      - FORGEJO__server__PROTOCOL=https
-      - FORGEJO__server__CERT_FILE=/certs/server-cert.pem
-      - FORGEJO__server__KEY_FILE=/certs/server-key.pem
+      - FORGEJO__server__PROTOCOL=http
       - FORGEJO__server__SSH_PORT=2222
       - FORGEJO__server__SSH_LISTEN_PORT=22
       - FORGEJO__repository__ALLOW_SELF_REVIEWS=true
@@ -32,7 +30,7 @@ services:
       forgejo-db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fk", "https://localhost:3000"]
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -63,7 +61,7 @@ services:
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
-      - GITEA_INSTANCE_URL=https://forgejo:3000
+      - GITEA_INSTANCE_URL=http://forgejo:3000
       - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN_FILE=/run/secrets/runner_token
       - GITEA_RUNNER_NAME=local-runner
@@ -74,7 +72,7 @@ services:
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
     security_opt:
       - label=disable
-    priviled: true
+    privileged: true
     depends_on:
       forgejo:
         condition: service_healthy
@@ -94,14 +92,13 @@ services:
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
-      - GITEA_INSTANCE_URL=https://forgejo:3000
+      - GITEA_INSTANCE_URL=http://forgejo:3000
       - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_TINY}
       - GITEA_RUNNER_NAME=runner-tiny
       - GITEA_RUNNER_LABELS=codeberg-tiny:docker://node:20-bookworm
     volumes:
       - forgejo_runner_tiny:/data
-      - ./runner-data/config.yml:/data/config.yml:ro,z
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
     security_opt:
       - label=disable
@@ -122,14 +119,13 @@ services:
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
-      - GITEA_INSTANCE_URL=https://forgejo:3000
+      - GITEA_INSTANCE_URL=http://forgejo:3000
       - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_SMALL}
       - GITEA_RUNNER_NAME=runner-small
       - GITEA_RUNNER_LABELS=codeberg-small:docker://node:20-bookworm
     volumes:
       - forgejo_runner_small:/data
-      - ./runner-data/config.yml:/data/config.yml:ro,z
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
     security_opt:
       - label=disable
@@ -150,14 +146,13 @@ services:
     working_dir: /data
     command: ["/bin/forgejo-runner", "daemon", "--config", "/data/config.yml"]
     environment:
-      - GITEA_INSTANCE_URL=https://forgejo:3000
+      - GITEA_INSTANCE_URL=http://forgejo:3000
       - GITEA_INSECURE=true
       - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN_MEDIUM}
       - GITEA_RUNNER_NAME=runner-medium
       - GITEA_RUNNER_LABELS=codeberg-medium:docker://node:20-bookworm
     volumes:
       - forgejo_runner_medium:/data
-      - ./runner-data/config.yml:/data/config.yml:ro,z
       - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:z
     security_opt:
       - label=disable

@@ -89,13 +89,14 @@ detect_runtime() {
 
   # For runner registration: podman-compose run is outside the pod network,
   # so we reach Forgejo via the host. Docker shares the compose network.
+  # Protocol matches FORGEJO__server__PROTOCOL (set to http in docker-compose.yml).
   if [[ "$CONTAINER_RUNTIME" == "podman" ]]; then
-    FORGEJO_INTERNAL_URL="https://host.containers.internal:${FORGEJO_HOST_PORT}"
+    FORGEJO_INTERNAL_URL="http://host.containers.internal:${FORGEJO_HOST_PORT}"
   else
-    FORGEJO_INTERNAL_URL="https://forgejo:3000"
+    FORGEJO_INTERNAL_URL="http://forgejo:3000"
   fi
 
-  FORGEJO_HOST_URL="https://localhost:${FORGEJO_HOST_PORT}"
+  FORGEJO_HOST_URL="http://localhost:${FORGEJO_HOST_PORT}"
 }
 
 # ---------------------------------------------------------------------------
@@ -119,16 +120,14 @@ kill_port() {
 
 # ---------------------------------------------------------------------------
 # compose_up [service ...]
-# Wrapper: podman-compose creates pods — 'down' tears down the pod cleanly.
-# docker compose up -d is idempotent natively.
+# Starts services via the detected compose tool. Both podman-compose and
+# docker compose support idempotent "up" — running it on already-running
+# services is a no-op. The previous podman path did a "down" first which
+# destroyed the pod and re-created it on every call, forcing Forgejo to
+# restart from scratch and causing bootstrap to time out.
 # ---------------------------------------------------------------------------
 compose_up() {
-  if [[ "$CONTAINER_RUNTIME" == "podman" ]]; then
-    $COMPOSE down 2>/dev/null || true
-    $COMPOSE up --detach "$@"
-  else
-    $COMPOSE up -d "$@"
-  fi
+  $COMPOSE up --detach "$@"
 }
 
 # ---------------------------------------------------------------------------
@@ -279,8 +278,7 @@ register_runner() {
       forgejo-runner register \
         -c /data/config.yml \
         --no-interactive \
-        --insecure \
-        --instance 'https://forgejo:3000' \
+        --instance 'http://forgejo:3000' \
         --name local-runner \
         --token '${token}' \
         --labels ubuntu-latest,linux/amd64"
@@ -367,6 +365,12 @@ bootstrap_additional_runners() {
 
   info "Bootstrapping additional runners..."
 
+  # Fetch a single registration token — Forgejo tokens can be reused for
+  # multiple runners, and rapid successive API calls may return the same token.
+  local shared_token
+  shared_token=$(fetch_registration_token)
+  info "Fetched shared registration token for additional runners"
+
   for i in "${!runners[@]}"; do
     local runner="${runners[$i]}"
     local name="${names[$i]}"
@@ -375,9 +379,8 @@ bootstrap_additional_runners() {
     local env_key="RUNNER_TOKEN_${runner^^}"
     local state_file="/data/.runner"
 
-    local token
-    token=$(fetch_registration_token)
-    update_env_token "$env_key" "$token"
+    # Persist token (shared across all additional runners)
+    update_env_token "$env_key" "$shared_token"
 
     local existing_runner
     existing_runner=$(
@@ -401,10 +404,9 @@ bootstrap_additional_runners() {
           forgejo-runner register \
             -c /data/config.yml \
             --no-interactive \
-            --insecure \
-            --instance 'https://forgejo:3000' \
+            --instance 'http://forgejo:3000' \
             --name ${name} \
-            --token '${token}' \
+            --token '${shared_token}' \
             --labels codeberg-${runner}"
 
       $CONTAINER_RUNTIME run --rm \
