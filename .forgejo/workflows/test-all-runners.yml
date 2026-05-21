@@ -1,0 +1,63 @@
+name: Test All Runners
+on: [push, workflow_dispatch]
+
+jobs:
+  test-ubuntu-latest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System info
+        run: |
+          echo "Runner: ubuntu-latest"
+          echo "Hostname: $(hostname)"
+          echo "CPUs: $(nproc)"
+          echo "Memory: $(free -h | grep Mem)"
+          echo "Disk: $(df -h / | tail -1)"
+
+  test-ubuntu-22-04:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System info
+        run: |
+          echo "Runner: ubuntu-22.04"
+          echo "Node version: $(node --version)"
+
+  test-debian-latest:
+    runs-on: debian-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System info
+        run: |
+          echo "Runner: debian-latest"
+          cat /etc/os-release
+
+  test-tiny:
+    runs-on: codeberg-tiny
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tiny runner info
+        run: |
+          echo "Runner: codeberg-tiny (0.5 CPU, 512MB RAM)"
+          echo "CPUs: $(nproc)"
+          free -h
+
+  test-small:
+    runs-on: codeberg-small
+    steps:
+      - uses: actions/checkout@v4
+      - name: Small runner info
+        run: |
+          echo "Runner: codeberg-small (1 CPU, 1GB RAM)"
+          echo "CPUs: $(nproc)"
+          free -h
+
+  test-medium:
+    runs-on: codeberg-medium
+    steps:
+      - uses: actions/checkout@v4
+      - name: Medium runner info
+        run: |
+          echo "Runner: codeberg-medium (2 CPUs, 2GB RAM)"
+          echo "CPUs: $(nproc)"
+          free -h
