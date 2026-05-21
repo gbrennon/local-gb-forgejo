@@ -90,12 +90,12 @@ detect_runtime() {
   # For runner registration: podman-compose run is outside the pod network,
   # so we reach Forgejo via the host. Docker shares the compose network.
   if [[ "$CONTAINER_RUNTIME" == "podman" ]]; then
-    FORGEJO_INTERNAL_URL="http://host.containers.internal:${FORGEJO_HOST_PORT}"
+    FORGEJO_INTERNAL_URL="https://host.containers.internal:${FORGEJO_HOST_PORT}"
   else
-    FORGEJO_INTERNAL_URL="http://forgejo:3000"
+    FORGEJO_INTERNAL_URL="https://forgejo:3000"
   fi
 
-  FORGEJO_HOST_URL="http://localhost:${FORGEJO_HOST_PORT}"
+  FORGEJO_HOST_URL="https://localhost:${FORGEJO_HOST_PORT}"
 }
 
 # ---------------------------------------------------------------------------
@@ -158,7 +158,7 @@ wait_for_forgejo() {
   info "Waiting for Forgejo API to be ready..."
   local retries=20
   local i=0
-  until curl -sf "${FORGEJO_HOST_URL}/api/v1/version" >/dev/null 2>&1; do
+  until curl -sfk "${FORGEJO_HOST_URL}/api/v1/version" >/dev/null 2>&1; do
     sleep 3
     i=$((i + 1))
     if [[ $i -ge $retries ]]; then
@@ -225,7 +225,7 @@ fetch_registration_token() {
   local tmpfile
   tmpfile=$(mktemp)
   local http_code
-  http_code=$(curl -s \
+  http_code=$(curl -sk \
     -o "$tmpfile" \
     -w "%{http_code}" \
     -u "${FORGEJO_ADMIN_USER}:${FORGEJO_ADMIN_PASSWORD}" \
@@ -279,7 +279,8 @@ register_runner() {
       forgejo-runner register \
         -c /data/config.yml \
         --no-interactive \
-        --instance 'http://forgejo:3000' \
+        --insecure \
+        --instance 'https://forgejo:3000' \
         --name local-runner \
         --token '${token}' \
         --labels ubuntu-latest,linux/amd64"
@@ -400,7 +401,8 @@ bootstrap_additional_runners() {
           forgejo-runner register \
             -c /data/config.yml \
             --no-interactive \
-            --instance 'http://forgejo:3000' \
+            --insecure \
+            --instance 'https://forgejo:3000' \
             --name ${name} \
             --token '${token}' \
             --labels codeberg-${runner}"
@@ -485,41 +487,28 @@ validate_container() {
 
 
 # ---------------------------------------------------------------------------
-# start_watcher
-# Launches watch-mirrors.sh as a persistent background host process.
-# Idempotent: stops any existing watcher before starting a fresh one.
+# start_autostart
+# Runs all autostart scripts in priority order.
+# Idempotent: each script handles its own PID file.
 # ---------------------------------------------------------------------------
-start_watcher() {
+start_autostart() {
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  local watcher="${repo_root}/scripts/watch-mirrors.sh"
-  local pid_file="${repo_root}/watcher.pid"
-  local log_file="${repo_root}/watcher.log"
+  local autostart_script="${repo_root}/scripts/autostart/autostart.sh"
 
-  if [[ ! -f "$watcher" ]]; then
-    warn "watch-mirrors.sh not found at ${watcher} — skipping watcher start."
+  if [[ ! -f "$autostart_script" ]]; then
+    warn "autostart.sh not found at ${autostart_script} — skipping autostart."
     return
   fi
 
-  # Stop any previously running watcher using the PID file.
-  if [[ -f "$pid_file" ]]; then
-    local old_pid
-    old_pid=$(cat "$pid_file")
-    if kill -0 "$old_pid" 2>/dev/null; then
-      info "Stopping existing watcher (PID ${old_pid})..."
-      kill "$old_pid" 2>/dev/null || true
-      sleep 2
-    fi
-    rm -f "$pid_file"
+  info "Running autostart scripts..."
+  if bash "$autostart_script"; then
+    ok "Autostart scripts started"
+    return
   fi
 
-  info "Starting mirror watcher in background..."
-  nohup bash "$watcher" >> "$log_file" 2>&1 &
-  local watcher_pid=$!
-  echo "$watcher_pid" > "$pid_file"
-  ok "Mirror watcher started (PID ${watcher_pid})"
-  info "  Logs: tail -f ${log_file}"
-  info "  Stop: kill \$(cat watcher.pid)"
+  warn "Autostart had errors — check logs:"
+  info "  Logs: tail -f watcher.log watch-prs.log"
 }
 
 # ---------------------------------------------------------------------------
@@ -545,9 +534,9 @@ main() {
   bootstrap_additional_runners
 
   if [[ "$skip_watcher" == false ]]; then
-    start_watcher
+    start_autostart
   else
-    info "Skipping watcher start (--no-watcher). Managed externally (e.g. systemd)."
+    info "Skipping autostart (--no-watcher). Managed externally (e.g. systemd)."
   fi
 }
 

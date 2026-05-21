@@ -41,6 +41,13 @@ fi
 echo $$ > "$WATCHER_PID_FILE"
 
 # ---------------------------------------------------------------------------
+# Hot-reload support
+# ---------------------------------------------------------------------------
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "${SCRIPT_DIR}/lib/hot-reload.sh"
+init_hot_reload "$REPO_ROOT"
+
+# ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 INTERVAL=60
@@ -256,15 +263,20 @@ print_run_status() {
 
 # ---------------------------------------------------------------------------
 # resolve_repos
-# Resolves the working list of repos: explicit filter or all mirrors.
+# Resolves the working list of repos: explicit filter or all repos.
 # ---------------------------------------------------------------------------
 resolve_repos() {
   if [[ -n "$REPOS_FILTER" ]]; then
     tr ',' '\n' <<< "$REPOS_FILTER"
   else
-    # Include both push repos (managed by this toolchain) and legacy pull mirrors.
-    # Pull mirrors are flagged with a warning; push repos use git_push_sync.
-    { forgejo_list_push_repos; forgejo_list_mirrors; } | sort -u
+    # Direct API call without sourcing libraries - avoid the common.sh issue
+    curl -sf -u "${AUTH}" "${FORGEJO_HOST}/api/v1/repos/search?limit=50" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+repos = data.get('data', [])
+for r in repos:
+    print(r['full_name'])
+"
   fi
 }
 
@@ -277,53 +289,32 @@ sync_cycle() {
   local timestamp
   timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-  local push_repos mirror_repos
-  push_repos=$(forgejo_list_push_repos)
-  mirror_repos=$(forgejo_list_mirrors)
+  # Get ALL repos via direct API call
+  local all_repos
+  all_repos=$(curl -sf -u "${AUTH}" "${FORGEJO_HOST}/api/v1/repos/search?limit=50" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+repos = data.get('data', [])
+for r in repos:
+    print(r['full_name'])
+")
 
-  local all_repos=()
-  while IFS= read -r r; do [[ -n "$r" ]] && all_repos+=("$r"); done <<< "$push_repos"
-  while IFS= read -r r; do [[ -n "$r" ]] && all_repos+=("$r"); done <<< "$mirror_repos"
+  local repo_array=()
+  while IFS= read -r r; do [[ -n "$r" ]] && repo_array+=("$r"); done <<< "$all_repos"
 
   echo ""
   echo "--------------------------------------------------------"
-  echo "  ${timestamp}  |  Cycle #${cycle}  |  ${#all_repos[@]} repo(s)"
+  echo "  ${timestamp}  |  Cycle #${cycle}  |  ${#repo_array[@]} repo(s)"
   echo "--------------------------------------------------------"
 
-  if [[ ${#all_repos[@]} -eq 0 ]]; then
+  if [[ ${#repo_array[@]} -eq 0 ]]; then
     warn "No repos found. Use ./scripts/mirror-repo.sh <org> <repo> to add one."
     return
   fi
 
   local failed=()
   declare -A fail_msgs=()
-  for repo in "${all_repos[@]}"; do
-    # Pull mirrors: Forgejo does not fire push events on mirror syncs so Actions
-    # never trigger. Auto-convert in place: delete the mirror and recreate as a
-    # regular repo under the same owner, then push from GitHub.
-    if echo "$mirror_repos" | grep -qx "$repo"; then
-      printf '    [..] %-32s pull mirror detected - auto-converting to push repo\n' "$repo"
-      local conv_slug
-      conv_slug=$(forgejo_convert_mirror_to_push "$repo" 2>&1) || {
-        printf '    [!!] %-32s conversion failed: %s\n' "$repo" "$conv_slug" >&2
-        failed+=("$repo")
-        fail_msgs["$repo"]="$conv_slug"
-        continue
-      }
-      printf '    [OK] %-32s converted - pushing from github.com/%s\n' "$repo" "$conv_slug"
-      local push_out
-      push_out=$(git_init_push "$repo" "$conv_slug" 2>&1) || {
-        printf '    [!!] %-32s initial push failed: %s\n' "$repo" "$push_out" >&2
-        failed+=("$repo")
-        fail_msgs["$repo"]="$push_out"
-        continue
-      }
-      printf '    [OK] %-32s push complete - waiting for Actions to queue\n' "$repo"
-      sleep 4
-      print_run_status "$repo"
-      report_runs_to_github "$repo" || true
-      continue
-    fi
+  for repo in "${repo_array[@]}"; do
 
     local github_slug
     github_slug=$(forgejo_get_mirror_source "$repo") || true
@@ -420,6 +411,7 @@ if github_has_pat; then
 else
   echo "    GitHub:   commit statuses disabled (set GITHUB_PAT in .env to enable)"
 fi
+echo "    Hot-reload: ENABLED (send SIGHUP to reload .env)"
 echo "    Ctrl+C to stop"
 
 require_forgejo
@@ -434,6 +426,6 @@ while true; do
     break
   fi
 
-  printf '\n  next sync in %ds\n' "$INTERVAL"
-  sleep "$INTERVAL"
+  printf '\n  next sync in %ds (hot-reload enabled)\n' "$INTERVAL"
+  interruptible_sleep "$INTERVAL"
 done

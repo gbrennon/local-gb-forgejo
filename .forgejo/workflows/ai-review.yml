@@ -1,0 +1,30 @@
+on: [pull_request]
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get PR diff
+        run: |
+          DIFF=$(curl -s -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            "${{ secrets.FORGEJO_URL }}/api/v1/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/diff")
+          
+          # Escape DIFF for JSON
+          DIFF_ESCAPED=$(echo "$DIFF" | jq -Rs .)
+          
+          curl -s -X POST http://host.containers.internal:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"code-review\",
+              \"prompt\": \"You are a Senior Principal Software Engineer and Code Reviewer. Review the following diff and provide feedback.\n\nDIFF:\n$DIFF_ESCAPED\",
+              \"stream\": false
+            }" > /tmp/review_response.json
+          
+          REVIEW=$(cat /tmp/review_response.json | jq -r '.response // empty')
+          
+          if [ -n "$REVIEW" ]; then
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "${{ secrets.FORGEJO_URL }}/api/v1/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+              -d "{\"body\": \"## AI Code Review\n\n$REVIEW\n\n---\n*Review by code-review via Forgejo Actions*\" }"
+          fi
